@@ -1,4 +1,5 @@
 #!/bin/sh
+# parser-build 7
 # Fetch a VPN subscription and write supported proxy links into Podkop.
 set -f
 
