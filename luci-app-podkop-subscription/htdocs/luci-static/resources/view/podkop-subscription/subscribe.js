@@ -10,6 +10,11 @@ var callStatus = rpc.declare({
 	method: 'status'
 });
 
+var callTraffic = rpc.declare({
+	object: 'podkop-subscription',
+	method: 'traffic'
+});
+
 var callPreview = rpc.declare({
 	object: 'podkop-subscription',
 	method: 'preview'
@@ -69,6 +74,37 @@ function saveForm(map) {
 	return uci.save();
 }
 
+function formatBytes(n) {
+	var units = [ 'КБ', 'МБ', 'ГБ', 'ТБ' ];
+	var digits, i;
+	n = Number(n);
+	if (!isFinite(n) || n < 0)
+		n = 0;
+	if (n < 1024)
+		return Math.round(n) + ' Б';
+	i = -1;
+	do {
+		n /= 1024;
+		i++;
+	} while (n >= 1024 && i < units.length - 1);
+	digits = n >= 100 ? 0 : 1;
+	return n.toFixed(digits).replace(/\.0$/, '') + ' ' + units[i];
+}
+
+function monthLabel(ym) {
+	var names = [
+		'январь', 'февраль', 'март', 'апрель', 'май', 'июнь',
+		'июль', 'август', 'сентябрь', 'октябрь', 'ноябрь', 'декабрь'
+	];
+	var parts = String(ym || '').split('-');
+	var month = Number(parts[1]);
+	var name;
+	if (!month || month < 1 || month > 12)
+		return ym || '';
+	name = names[month - 1];
+	return name.charAt(0).toUpperCase() + name.slice(1) + ' ' + parts[0];
+}
+
 return view.extend({
 	load: function() {
 		return Promise.all([
@@ -83,7 +119,9 @@ return view.extend({
 		var status = data[1] || {};
 		var sections = (status.sections && status.sections.length) ? status.sections : [ 'main' ];
 		var m, s, o;
+		var view = this;
 		var outBox = E('div', { 'id': 'pksub-out' });
+		var trafficBox = E('div', { 'id': 'pksub-traffic' });
 
 		m = new form.Map('podkop-subscription', _('Подписка Podkop'),
 			_('Скачивает подписку и записывает ссылки в выбранную секцию Podkop. Списки доменов и остальные правила секции не меняются. Тип секции становится Proxy. Ссылки с транспортом xhttp заработают, если установлен podkop-engine.'));
@@ -287,6 +325,90 @@ return view.extend({
 			])
 		]);
 
+		function noteBox(text, kind) {
+			var color = (kind === 'error') ? 'rgba(180,40,40,.15)' : 'rgba(180,120,0,.18)';
+			return E('div', {
+				'style': 'margin:.7em 0 0; padding:.7em .9em; border-radius:4px; background:' + color
+			}, text);
+		}
+
+		function statCard(title, obj) {
+			var up = Number(obj && obj.up) || 0;
+			var down = Number(obj && obj.down) || 0;
+			var total = Number(obj && obj.total);
+			if (!isFinite(total))
+				total = up + down;
+			return E('div', {
+				'style': 'flex:1 1 16em; padding:.85em 1em; border-radius:4px; background:rgba(0,0,0,.06);'
+			}, [
+				E('div', {}, title),
+				E('div', {
+					'style': 'font-size:1.35em; font-weight:600; line-height:1.2; margin-top:.2em;'
+				}, formatBytes(total)),
+				E('div', { 'style': 'margin-top:.35em;' }, '↑ ' + formatBytes(up) + '   ↓ ' + formatBytes(down))
+			]);
+		}
+
+		function paintTraffic(tr) {
+			var body = [];
+			var meta = [];
+			var previous;
+			while (trafficBox.firstChild)
+				trafficBox.removeChild(trafficBox.firstChild);
+			body.push(E('h3', { 'style': 'margin:0 0 .4em;' }, _('Трафик за месяц')));
+			body.push(E('p', { 'style': 'margin:.2em 0 .8em; max-width:48em;' },
+				_('Через VPN — трафик, который Podkop отправил в прокси. Напрямую — трафик, который ушёл в интернет мимо Podkop. Сумма за календарный месяц хранится на роутере и не сбрасывается при перезапуске Podkop.')));
+			if (!tr || tr.ok === false) {
+				body.push(noteBox((tr && tr.error) || _('Служба не вернула статистику. Выполните /etc/init.d/rpcd restart и обновите страницу.'), 'error'));
+			} else {
+				if (tr.month)
+					body.push(E('div', { 'style': 'font-weight:600; margin-bottom:.5em;' }, monthLabel(tr.month)));
+				body.push(E('div', { 'style': 'display:flex; gap:.8em; flex-wrap:wrap;' }, [
+					statCard(_('Через VPN'), tr.vpn || {}),
+					statCard(_('Напрямую'), tr.direct || {})
+				]));
+				body.push(E('div', { 'style': 'margin-top:.45em; opacity:.8;' }, _('↑ исходящий, ↓ входящий')));
+				if (tr.empty)
+					body.push(noteBox(_('Счётчик ещё не записан. Нажмите «Обновить статистику» через несколько секунд.'), 'warn'));
+				if (tr.vpn_available === false)
+					body.push(noteBox(_('Podkop сейчас не ответил, поэтому трафик через VPN за последние минуты ещё не добавлен. Уже сохранённая сумма на месте.'), 'warn'));
+				if (tr.direct_available === false)
+					body.push(noteBox(_('Счётчик прямого трафика не включился. Для него нужен nftables, он ставится вместе с Podkop.'), 'warn'));
+				if (tr.flow_offload)
+					body.push(noteBox(_('Включён flow offload. Прямой трафик может быть меньше реального: часть пакетов ядро проводит мимо счётчика.'), 'warn'));
+				previous = tr.previous;
+				if (previous && previous.month) {
+					body.push(E('div', { 'style': 'margin-top:.7em;' },
+						_('Прошлый месяц') + ', ' + monthLabel(previous.month) + ': ' +
+						_('через VPN') + ' ' + formatBytes((previous.vpn || {}).total) + ', ' +
+						_('напрямую') + ' ' + formatBytes((previous.direct || {}).total) + '.'));
+				}
+				if (tr.since)
+					meta.push(_('Учёт с ') + tr.since);
+				if (tr.updated)
+					meta.push(_('обновлено ') + tr.updated);
+				if (meta.length)
+					body.push(E('div', { 'style': 'margin-top:.6em; opacity:.8;' }, meta.join('. ') + '.'));
+			}
+			body.push(E('div', { 'style': 'margin-top:.7em;' }, E('button', {
+				'class': 'btn cbi-button cbi-button-action',
+				'type': 'button',
+				'click': ui.createHandlerFn(view, function() {
+					return callTraffic().then(function(res) {
+						paintTraffic(res);
+					}).catch(function() {
+						paintTraffic({
+							ok: false,
+							error: _('Сервис на роутере не ответил. Выполните /etc/init.d/rpcd restart и обновите страницу.')
+						});
+					});
+				})
+			}, _('Обновить статистику'))));
+			trafficBox.appendChild(E('div', { 'class': 'cbi-section' }, [
+				E('div', { 'class': 'cbi-section-node' }, body)
+			]));
+		}
+
 		var root = E('div');
 		if (status.ok === false || status.podkop === false) {
 			root.appendChild(E('div', {
@@ -299,6 +421,9 @@ return view.extend({
 				'style': 'margin:0 0 1em; padding:.7em .9em; border-radius:4px; background:rgba(0,0,0,.06);'
 			}, _('С подпиской отправляется HWID: ') + status.hwid));
 		}
+
+		root.appendChild(trafficBox);
+		paintTraffic(status.traffic);
 
 		var self = this;
 		return m.render().then(function(node) {

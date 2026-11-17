@@ -9,7 +9,8 @@ case "$1" in
 	"apply": {
 		"server": "str"
 	},
-	"cron_sync": {}
+	"cron_sync": {},
+	"traffic": {}
 }
 EOF
 		;;
@@ -35,6 +36,10 @@ EOF
 			cron_sync)
 				cat >/dev/null
 				exec /usr/bin/podkop-subscription cron-sync
+				;;
+			traffic)
+				cat >/dev/null
+				exec /usr/bin/podkop-subscription traffic
 				;;
 		esac
 		;;

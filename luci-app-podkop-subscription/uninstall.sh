@@ -14,7 +14,13 @@ fi
 if [ -f /etc/crontabs/root ]; then
 	sed -i '/# podkop-subscription begin/,/# podkop-subscription end/d' /etc/crontabs/root || true
 	sed -i '\#/usr/bin/podkop-subscription apply#d' /etc/crontabs/root || true
+	sed -i '/# podkop-subscription-traffic begin/,/# podkop-subscription-traffic end/d' /etc/crontabs/root || true
+	sed -i '\#/usr/bin/podkop-subscription traffic-sample#d' /etc/crontabs/root || true
 	/etc/init.d/cron reload >/dev/null 2>&1 || true
+fi
+
+if command -v nft >/dev/null 2>&1; then
+	nft delete table inet PodkopSubAcct >/dev/null 2>&1 || true
 fi
 
 rm -f \
