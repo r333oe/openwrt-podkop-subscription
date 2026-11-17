@@ -43,7 +43,7 @@ install_one() {
 		cp "$SRC/$rel" "$dest"
 	else
 		echo "Скачиваю $rel"
-		wget -O "$dest" "$RAW/$rel" || {
+		wget -O "$dest" "$RAW/$rel?v=5" || {
 			echo "Не удалось скачать $rel" >&2
 			exit 1
 		}

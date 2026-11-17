@@ -243,7 +243,10 @@ classify_error() {
 		fail "Это подписка Clash. Поставьте User-Agent v2rayNG/1.8.29: тогда сервис обычно отдаёт список vless://."
 	fi
 	if grep -a -q -E '"(outbounds|endpoints)"' "$WORKDIR/body" "$WORKDIR/text" 2>/dev/null; then
-		fail "Панель отдала конфиг sing-box, но в нём не нашлось серверов VLESS."
+		if [ -n "$JQ_ERR" ]; then
+			fail "Не удалось разобрать JSON подписки: $JQ_ERR"
+		fi
+		fail "Панель отдала JSON с серверами, но VLESS в нём не распознан."
 	fi
 	if grep -a -q -F 'HWID' "$WORKDIR/body" "$WORKDIR/text" 2>/dev/null; then
 		fail "Панель не приняла идентификатор устройства. Отправлен HWID: $HWID"
@@ -255,6 +258,7 @@ singbox_to_links() {
 	src=$1
 	dst=$2
 	filt=$dst.filter
+	JQ_ERR=""
 	cat > "$filt" <<'EOF'
 def filled($v): $v != null and ($v | tostring) != "";
 def enc: tostring | @uri;
@@ -368,12 +372,18 @@ items
 | .[]
 EOF
 	if ! jq -r -f "$filt" "$src" > "$dst" 2>"$dst.err"; then
-		cat "$dst.err" >&2
+		JQ_ERR=$(head -n 1 "$dst.err" 2>/dev/null | cut -c1-180 | tr '\r\n' ' ')
 		return 1
 	fi
-	grep -a -E '^vless://' "$dst" > "$dst.ok" 2>/dev/null || true
-	mv "$dst.ok" "$dst"
-	[ -s "$dst" ]
+	first=$(head -n 1 "$dst" 2>/dev/null || true)
+	case "$first" in
+		vless://*) ;;
+		*)
+			JQ_ERR=$(head -n 1 "$dst.err" 2>/dev/null | cut -c1-180 | tr '\r\n' ' ')
+			return 1
+			;;
+	esac
+	return 0
 }
 
 run_curl() {
