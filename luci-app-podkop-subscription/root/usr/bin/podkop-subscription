@@ -347,9 +347,14 @@ def xray_vless($o):
       | join("&")
     ) as $q
   | "vless://\($u.id)@\(if ($n.address | tostring | test(":")) then "[\($n.address)]" else $n.address end):\($n.port)?\($q)#\(if filled($o.tag) then ($o.tag | enc) else ($n.address | enc) end)";
+def primary($cfg):
+  (($cfg.outbounds // []) | map(select((.protocol == "vless" or .type == "vless") and .tag == "proxy")) | .[0])
+  // (($cfg.outbounds // []) | map(select(.protocol == "vless" or .type == "vless")) | .[0]);
 def items:
-  if type == "array" then .
+  if type == "array" and ((.[0].outbounds | type) == "array") then
+    map(. as $cfg | primary($cfg) | select(. != null) | . + {tag: ($cfg.remarks // $cfg.ps // .tag)})
   elif type == "object" then ((.outbounds // []) + (.endpoints // []))
+  elif type == "array" then .
   else [] end;
 items
 | map(
@@ -951,6 +956,50 @@ EOF
 	singbox_to_links "$WORKDIR/notice.json" "$WORKDIR/notice-links" || { printf 'notice convert failed\n'; exit 1; }
 	notice=$(panel_notice "$WORKDIR/notice-links") || { printf 'notice not detected\n'; exit 1; }
 	printf '%s' "$notice" | grep -q 'достигли' || { printf 'notice text missing: %s\n' "$notice"; exit 1; }
+
+	cat > "$WORKDIR/xray-list.json" <<'EOF'
+[
+  {
+    "remarks": "Нидерланды",
+    "outbounds": [
+      {
+        "tag": "proxy",
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "nl.example",
+              "port": 443,
+              "users": [{ "id": "11111111-1111-1111-1111-111111111111", "encryption": "none" }]
+            }
+          ]
+        },
+        "streamSettings": { "network": "tcp", "security": "none" }
+      },
+      {
+        "tag": "proxy-2",
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "backup.example",
+              "port": 443,
+              "users": [{ "id": "22222222-2222-2222-2222-222222222222", "encryption": "none" }]
+            }
+          ]
+        },
+        "streamSettings": { "network": "tcp", "security": "none" }
+      },
+      { "tag": "direct", "protocol": "freedom" }
+    ]
+  }
+]
+EOF
+	singbox_to_links "$WORKDIR/xray-list.json" "$WORKDIR/xray-list-links" || { printf 'xray list convert failed\n'; exit 1; }
+	count=$(grep -c '^vless://' "$WORKDIR/xray-list-links" || true)
+	[ "$count" -eq 1 ] || { printf 'xray list count %s\n' "$count"; exit 1; }
+	grep -q 'nl.example:443' "$WORKDIR/xray-list-links" || { printf 'xray list host missing\n'; exit 1; }
+	grep -q 'backup.example' "$WORKDIR/xray-list-links" && { printf 'backup outbound leaked\n'; exit 1; }
 	printf '%s\n' OK
 }
 
