@@ -29,12 +29,35 @@ function optionValue(map, name) {
 	return (value == null) ? '' : String(value);
 }
 
+function subscriptionUrls(map) {
+	var opts = map.lookupOption('url', 'main');
+	if (!opts || !opts[0])
+		return [];
+	var value = opts[0].formvalue('main');
+	var list = [];
+	if (Array.isArray(value))
+		list = value;
+	else if (value)
+		list = [ value ];
+	var urls = [];
+	list.forEach(function(item) {
+		item = String(item || '').trim();
+		if (item)
+			urls.push(item);
+	});
+	return urls;
+}
+
 function saveForm(map) {
-	var names = [ 'url', 'target', 'mode', 'server', 'only_vless', 'restart', 'interval', 'user_agent', 'hwid' ];
+	var names = [ 'url', 'target', 'mode', 'server', 'only_vless', 'ignore_ru', 'ignore_auto', 'restart', 'interval', 'user_agent', 'hwid' ];
 	if (!uci.get('podkop-subscription', 'main'))
 		uci.add('podkop-subscription', 'subscription', 'main');
 
 	names.forEach(function(name) {
+		if (name === 'url') {
+			uci.set('podkop-subscription', 'main', 'url', subscriptionUrls(map));
+			return;
+		}
 		var value = optionValue(map, name);
 		if (name === 'server') {
 			var pick = document.getElementById('pksub-pick');
@@ -69,8 +92,8 @@ return view.extend({
 		s.anonymous = false;
 		s.addremove = false;
 
-		o = s.option(form.Value, 'url', _('Ссылка подписки'),
-			_('Адрес вида https://…, по которому лежит список серверов.'));
+		o = s.option(form.DynamicList, 'url', _('Ссылки подписок'),
+			_('Можно добавить несколько. Серверы из всех ссылок собираются в один список.'));
 		o.placeholder = 'https://';
 		o.rmempty = false;
 		o.validate = function(section_id, value) {
@@ -102,6 +125,16 @@ return view.extend({
 
 		o = s.option(form.Flag, 'only_vless', _('Только VLESS'),
 			_('Если снять, дополнительно записываются Shadowsocks, Trojan, Hysteria2 и SOCKS.'));
+		o.default = '1';
+		o.rmempty = false;
+
+		o = s.option(form.Flag, 'ignore_ru', _('Игнорировать RU серверы'),
+			_('Не записывать серверы с флагом 🇷🇺 или со словом «Россия» в имени.'));
+		o.default = '1';
+		o.rmempty = false;
+
+		o = s.option(form.Flag, 'ignore_auto', _('Игнорировать «Авто»'),
+			_('Не записывать серверы, в имени которых есть «Авто».'));
 		o.default = '1';
 		o.rmempty = false;
 
@@ -201,11 +234,14 @@ return view.extend({
 		}
 
 		function validateUrl() {
-			var url = optionValue(m, 'url').trim();
-			if (!url)
+			var urls = subscriptionUrls(m);
+			var i;
+			if (!urls.length)
 				return _('Вставьте ссылку подписки');
-			if (!/^https?:\/\/\S+$/i.test(url))
-				return _('Нужна ссылка http:// или https:// без пробелов');
+			for (i = 0; i < urls.length; i++) {
+				if (!/^https?:\/\/\S+$/i.test(urls[i]))
+					return _('Нужна ссылка http:// или https:// без пробелов');
+			}
 			return null;
 		}
 
