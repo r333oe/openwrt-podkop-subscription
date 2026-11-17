@@ -37,8 +37,8 @@ function subscriptionUrls(map) {
 	var list = [];
 	if (Array.isArray(value))
 		list = value;
-	else if (value)
-		list = [ value ];
+	if (typeof value === 'string')
+		list = value.split(/[\s,]+/);
 	var urls = [];
 	list.forEach(function(item) {
 		item = String(item || '').trim();

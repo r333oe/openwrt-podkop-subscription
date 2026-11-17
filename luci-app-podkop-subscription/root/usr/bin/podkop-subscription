@@ -1,5 +1,5 @@
 #!/bin/sh
-# parser-build 9
+# parser-build 10
 # Fetch a VPN subscription and write supported proxy links into Podkop.
 set -f
 
@@ -105,55 +105,66 @@ read_urls() {
 }
 
 parse_uci_url_line() {
-	printf '%s\n' "$1" | awk '
-	{
-		line = $0
-		sub(/^[^=]*=/, "", line)
-		q = sprintf("%c", 39)
-		bs = sprintf("%c", 92)
-		esc = q bs q q
-		n = length(line)
-		i = 1
-		while (i <= n) {
-			c = substr(line, i, 1)
-			if (c == " " || c == "\t") {
-				i++
-				continue
-			}
-			if (c == q) {
-				i++
-				val = ""
-				while (i <= n) {
-					c = substr(line, i, 1)
-					if (c == q) {
-						if (substr(line, i, 4) == esc) {
-							val = val q
-							i += 4
-							continue
-						}
-						i++
-						break
-					}
-					val = val c
-					i++
-				}
-				if (val != "")
-					print val
-			} else {
-				val = ""
-				while (i <= n) {
-					c = substr(line, i, 1)
-					if (c == " " || c == "\t")
-						break
-					val = val c
-					i++
-				}
-				if (val != "")
-					print val
-			}
-		}
-	}
-	'
+	line=${1#*=}
+	q="'"
+	bs='\'
+	esc="${q}${bs}${q}${q}"
+	while [ -n "$line" ]; do
+		case "$line" in
+			" "*|"	"*)
+				line=${line#?}
+				;;
+			"$q"*)
+				line=${line#"$q"}
+				val=
+				while [ -n "$line" ]; do
+					case "$line" in
+						"$esc"*)
+							val="${val}${q}"
+							line=${line#"$esc"}
+							;;
+						"$q"*)
+							line=${line#"$q"}
+							break
+							;;
+						*)
+							ch=${line%"${line#?}"}
+							val="${val}${ch}"
+							line=${line#?}
+							;;
+					esac
+				done
+				emit_url_value "$val"
+				;;
+			*)
+				val=${line%% *}
+				val=${val%%	*}
+				emit_url_value "$val"
+				line=${line#"$val"}
+				;;
+		esac
+	done
+}
+
+emit_url_value() {
+	val=$1
+	case "$val" in
+		*[[:space:]]*)
+			printf '%s' "$val" | tr ' \t' '\n\n' | while IFS= read -r piece || [ -n "$piece" ]; do
+				piece=${piece#\'}
+				piece=${piece%\'}
+				case "$piece" in
+					http://*|https://*) printf '%s\n' "$piece" ;;
+				esac
+			done
+			;;
+		http://*|https://*)
+			printf '%s\n' "$val"
+			;;
+		*)
+			[ -n "$val" ] && printf '%s\n' "$val"
+			;;
+	esac
 }
 
 validate_settings() {
@@ -1006,10 +1017,13 @@ run_self_test() {
 	grep -q 'bad.example' "$LINKS" && { printf 'unsafe link kept\n'; exit 1; }
 
 	parsed=$(parse_uci_url_line "podkop-subscription.main.url='https://a.example/one' 'https://b.example/two?x=1&y=2'")
-	printf '%s\n' "$parsed" | grep -q '^https://a.example/one$' || { printf 'url 1 parse failed\n'; exit 1; }
+	printf '%s\n' "$parsed" | grep -q '^https://a.example/one$' || { printf 'url 1 parse failed\n%s\n' "$parsed"; exit 1; }
 	printf '%s\n' "$parsed" | grep -q '^https://b.example/two?x=1&y=2$' || { printf 'url 2 parse failed\n%s\n' "$parsed"; exit 1; }
 	count=$(printf '%s\n' "$parsed" | grep -c '^https://')
 	[ "$count" -eq 2 ] || { printf 'url count %s\n' "$count"; exit 1; }
+	parsed=$(parse_uci_url_line "podkop-subscription.main.url='https://a.example/one https://b.example/two?x=1&y=2'")
+	printf '%s\n' "$parsed" | grep -q '^https://a.example/one$' || { printf 'joined url 1 failed\n%s\n' "$parsed"; exit 1; }
+	printf '%s\n' "$parsed" | grep -q '^https://b.example/two?x=1&y=2$' || { printf 'joined url 2 failed\n%s\n' "$parsed"; exit 1; }
 
 	IGNORE_RU=1
 	IGNORE_AUTO=1
