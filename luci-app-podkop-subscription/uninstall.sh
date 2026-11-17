@@ -29,13 +29,15 @@ rm -f \
 	/etc/init.d/podkop-subscription \
 	/usr/share/luci/menu.d/luci-app-podkop-subscription.json \
 	/usr/share/rpcd/acl.d/luci-app-podkop-subscription.json \
-	/www/luci-static/resources/view/podkop-subscription/subscribe.js
+	/www/luci-static/resources/view/podkop-subscription/subscribe.js \
+	/www/luci-static/resources/view/podkop-subscription/v12.js
 
 rm -rf /etc/podkop-subscription
 rmdir /www/luci-static/resources/view/podkop-subscription 2>/dev/null || true
 
 /etc/init.d/rpcd restart >/dev/null 2>&1 || true
-rm -f /tmp/luci-indexcache 2>/dev/null || true
+rm -f /tmp/luci-indexcache /tmp/luci-indexcache.* 2>/dev/null || true
+rm -rf /tmp/luci-modulecache 2>/dev/null || true
 
 echo "Дополнение удалено."
 echo "Ссылки, уже записанные в /etc/config/podkop, оставлены."
