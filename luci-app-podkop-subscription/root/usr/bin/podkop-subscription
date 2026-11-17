@@ -242,13 +242,91 @@ classify_error() {
 	if grep -a -q -E 'proxies:|proxy-groups:' "$WORKDIR/body" "$WORKDIR/text" 2>/dev/null; then
 		fail "Это подписка Clash. Поставьте User-Agent v2rayNG/1.8.29: тогда сервис обычно отдаёт список vless://."
 	fi
-	if grep -a -q '"outbounds"' "$WORKDIR/body" "$WORKDIR/text" 2>/dev/null; then
-		fail "Это конфиг sing-box JSON, в нём нет списка vless://."
+	if grep -a -q -E '"(outbounds|endpoints)"' "$WORKDIR/body" "$WORKDIR/text" 2>/dev/null; then
+		fail "Панель отдала конфиг sing-box, но в нём не нашлось серверов VLESS."
 	fi
 	if grep -a -q -F 'HWID' "$WORKDIR/body" "$WORKDIR/text" 2>/dev/null; then
 		fail "Панель не приняла идентификатор устройства. Отправлен HWID: $HWID"
 	fi
 	fail "В ответе не нашлось ссылок. Проверьте ссылку и User-Agent."
+}
+
+singbox_to_links() {
+	src=$1
+	dst=$2
+	filt=$dst.filter
+	cat > "$filt" <<'EOF'
+def filled($v): $v != null and ($v | tostring) != "";
+def enc: tostring | @uri;
+def add($name; $value):
+  if filled($value) then ["\($name)=\($value | enc)"] else [] end;
+def net($o):
+  if filled($o.transport.type) then
+    if $o.transport.type == "splithttp" then "xhttp" else $o.transport.type end
+  else "tcp" end;
+def security($o):
+  if $o.tls.reality.enabled == true then "reality"
+  elif $o.tls.enabled == true then "tls"
+  else "none" end;
+def header_host($t):
+  if $t == null then null
+  elif ($t.headers.Host | type) == "array" then $t.headers.Host[0]
+  elif filled($t.headers.Host) then $t.headers.Host
+  elif ($t.host | type) == "array" then $t.host[0]
+  elif filled($t.host) then $t.host
+  else null end;
+def host_of($o):
+  if ($o.server | tostring | test(":")) then "[\($o.server)]" else ($o.server | tostring) end;
+def tag_of($o):
+  if filled($o.tag) then ($o.tag | enc) else ($o.server | enc) end;
+def vless_link($o):
+  (net($o)) as $type
+  | (security($o)) as $sec
+  | (header_host($o.transport)) as $host
+  | (
+      ["encryption=none", "security=\($sec)", "type=\($type)"]
+      + (if filled($o.flow) and (($o.flow | tostring) | contains("udp443") | not) then ["flow=\($o.flow | enc)"] else [] end)
+      + add("sni"; $o.tls.server_name)
+      + (if $sec == "reality" then
+          add("fp"; ($o.tls.utls.fingerprint // "chrome"))
+          + add("pbk"; ($o.tls.reality.public_key // $o.tls.reality.publicKey))
+          + add("sid"; ($o.tls.reality.short_id // $o.tls.reality.shortId))
+          + add("spx"; ($o.tls.reality.spider_x // $o.tls.reality.spiderX))
+        elif $sec == "tls" then
+          add("fp"; $o.tls.utls.fingerprint)
+          + (if ($o.tls.alpn | type) == "array" and ($o.tls.alpn | length) > 0 then ["alpn=\($o.tls.alpn | join(",") | enc)"] else [] end)
+          + (if $o.tls.insecure == true then ["allowInsecure=1"] else [] end)
+        else [] end)
+      + (if ($type == "ws" or $type == "http" or $type == "httpupgrade" or $type == "xhttp") then
+          add("path"; $o.transport.path)
+          + add("host"; $host)
+          + add("mode"; $o.transport.mode)
+        elif $type == "grpc" then
+          add("serviceName"; ($o.transport.service_name // $o.transport.serviceName))
+        else [] end)
+      | join("&")
+    ) as $q
+  | "vless://\($o.uuid)@\(host_of($o)):\($o.server_port)?\($q)#\(tag_of($o))";
+def items:
+  if type == "array" then .
+  elif type == "object" then ((.outbounds // []) + (.endpoints // []))
+  else [] end;
+items
+| map(
+    if .type == "vless" and filled(.uuid) and filled(.server) and .server_port != null
+       and ((.tls.reality.enabled != true) or filled(.tls.reality.public_key // .tls.reality.publicKey))
+    then vless_link(.)
+    else empty end
+  )
+| .[]
+EOF
+	if ! jq -r -f "$filt" "$src" > "$dst" 2>"$dst.err"; then
+		cat "$dst.err" >&2
+		return 1
+	fi
+	grep -a -E '^vless://' "$dst" > "$dst.ok" 2>/dev/null || true
+	mv "$dst.ok" "$dst"
+	[ -s "$dst" ]
 }
 
 run_curl() {
@@ -294,6 +372,10 @@ prepare_text() {
 		return 0
 	fi
 	[ -f "$WORKDIR/text" ] || cp "$WORKDIR/body" "$WORKDIR/text"
+	if singbox_to_links "$WORKDIR/text" "$WORKDIR/from-json"; then
+		cp "$WORKDIR/from-json" "$WORKDIR/text"
+		return 0
+	fi
 	classify_error
 }
 
@@ -673,6 +755,53 @@ run_self_test() {
 	RAW=$WORKDIR/gz.b64
 	prepare_text || { printf 'gzip+base64 decode failed\n'; exit 1; }
 	grep -q 'Amsterdam' "$WORKDIR/text" || { printf 'gzip text missing name\n'; exit 1; }
+
+	if ! command -v jq >/dev/null 2>&1; then
+		printf '%s\n' 'sing-box test skipped, jq is missing'
+		printf '%s\n' OK
+		return 0
+	fi
+	cat > "$WORKDIR/singbox.json" <<'EOF'
+{
+  "outbounds": [
+    {
+      "type": "vless",
+      "tag": "Amsterdam",
+      "server": "nl.example",
+      "server_port": 443,
+      "uuid": "11111111-1111-1111-1111-111111111111",
+      "flow": "xtls-rprx-vision",
+      "tls": {
+        "enabled": true,
+        "server_name": "www.google.com",
+        "utls": { "enabled": true, "fingerprint": "chrome" },
+        "reality": { "enabled": true, "public_key": "abcKEY", "short_id": "abcd" }
+      }
+    },
+    {
+      "type": "vless",
+      "tag": "WS node",
+      "server": "ws.example",
+      "server_port": 8443,
+      "uuid": "22222222-2222-2222-2222-222222222222",
+      "tls": {
+        "enabled": true,
+        "server_name": "ws.example",
+        "utls": { "fingerprint": "firefox" }
+      },
+      "transport": { "type": "ws", "path": "/ws path", "headers": { "Host": "ws.example" } }
+    },
+    { "type": "direct", "tag": "direct" }
+  ]
+}
+EOF
+	singbox_to_links "$WORKDIR/singbox.json" "$WORKDIR/from-json" || { printf 'singbox convert failed\n'; exit 1; }
+	grep -q 'vless://11111111-1111-1111-1111-111111111111@nl.example:443?' "$WORKDIR/from-json" || { printf 'reality link missing\n'; exit 1; }
+	grep -q 'security=reality' "$WORKDIR/from-json" || { printf 'reality params missing\n'; exit 1; }
+	grep -q 'pbk=abcKEY' "$WORKDIR/from-json" || { printf 'pbk missing\n'; exit 1; }
+	grep -q 'type=ws' "$WORKDIR/from-json" || { printf 'ws type missing\n'; exit 1; }
+	grep -q 'path=%2Fws%20path' "$WORKDIR/from-json" || { printf 'ws path missing\n'; exit 1; }
+	grep -q 'direct' "$WORKDIR/from-json" && { printf 'direct outbound leaked\n'; exit 1; }
 	printf '%s\n' OK
 }
 
