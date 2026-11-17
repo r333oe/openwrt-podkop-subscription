@@ -280,7 +280,7 @@ def header_host($t):
   elif filled($t.host) then $t.host
   else null end;
 def host_of($o):
-  if ($o.server | tostring | test(":")) then "[\($o.server)]" else ($o.server | tostring) end;
+  if (($o.server | tostring | index(":")) != null) then "[\($o.server)]" else ($o.server | tostring) end;
 def tag_of($o):
   if filled($o.tag) then ($o.tag | enc) else ($o.server | enc) end;
 def vless_link($o):
@@ -350,7 +350,7 @@ def xray_vless($o):
         else [] end)
       | join("&")
     ) as $q
-  | "vless://\($u.id)@\(if ($n.address | tostring | test(":")) then "[\($n.address)]" else $n.address end):\($n.port)?\($q)#\(if filled($o.tag) then ($o.tag | enc) else ($n.address | enc) end)";
+  | "vless://\($u.id)@\(if (($n.address | tostring | index(":")) != null) then "[\($n.address)]" else $n.address end):\($n.port)?\($q)#\(if filled($o.tag) then ($o.tag | enc) else ($n.address | enc) end)";
 def primary($cfg):
   (($cfg.outbounds // []) | map(select((.protocol == "vless" or .type == "vless") and .tag == "proxy")) | .[0])
   // (($cfg.outbounds // []) | map(select(.protocol == "vless" or .type == "vless")) | .[0]);
