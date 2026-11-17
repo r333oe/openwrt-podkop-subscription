@@ -1,4 +1,5 @@
 'use strict';
+/* podkop-subscription interface v12 */
 'require view';
 'require form';
 'require uci';
@@ -355,9 +356,6 @@ return view.extend({
 			var previous;
 			while (trafficBox.firstChild)
 				trafficBox.removeChild(trafficBox.firstChild);
-			body.push(E('h3', { 'style': 'margin:0 0 .4em;' }, _('Трафик за месяц')));
-			body.push(E('p', { 'style': 'margin:.2em 0 .8em; max-width:48em;' },
-				_('Через VPN — трафик, который Podkop отправил в прокси. Напрямую — трафик, который ушёл в интернет мимо Podkop. Сумма за календарный месяц хранится на роутере и не сбрасывается при перезапуске Podkop.')));
 			if (!tr || tr.ok === false) {
 				body.push(noteBox((tr && tr.error) || _('Служба не вернула статистику. Выполните /etc/init.d/rpcd restart и обновите страницу.'), 'error'));
 			} else {
@@ -404,7 +402,10 @@ return view.extend({
 					});
 				})
 			}, _('Обновить статистику'))));
-			trafficBox.appendChild(E('div', { 'class': 'cbi-section' }, [
+			trafficBox.appendChild(E('div', { 'class': 'cbi-section', 'id': 'pksub-traffic-section' }, [
+				E('h3', {}, _('Трафик за месяц')),
+				E('div', { 'class': 'cbi-section-descr' },
+					_('Через VPN — трафик, который Podkop отправил в прокси. Напрямую — трафик, который ушёл в интернет мимо Podkop. Сумма за календарный месяц хранится на роутере и не сбрасывается при перезапуске Podkop.')),
 				E('div', { 'class': 'cbi-section-node' }, body)
 			]));
 		}
@@ -422,11 +423,17 @@ return view.extend({
 			}, _('С подпиской отправляется HWID: ') + status.hwid));
 		}
 
-		root.appendChild(trafficBox);
 		paintTraffic(status.traffic);
 
 		var self = this;
 		return m.render().then(function(node) {
+			var anchor = (node && node.querySelector) ? node.querySelector('.cbi-section') : null;
+			if (anchor && anchor.parentNode)
+				anchor.parentNode.insertBefore(trafficBox, anchor);
+			else if (node && node.appendChild)
+				node.appendChild(trafficBox);
+			else
+				root.appendChild(trafficBox);
 			root.appendChild(node);
 			root.appendChild(actions);
 			if (status.state)

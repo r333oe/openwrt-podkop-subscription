@@ -1,7 +1,7 @@
 #!/bin/sh
 # One-file installer. The parser is embedded below so a cached copy of the
 # separate script cannot be installed by mistake.
-# wget -O /tmp/podkop-subscription-install.sh "https://raw.githubusercontent.com/r333oe/openwrt-podkop-subscription/main/install.sh?v=11" && sh /tmp/podkop-subscription-install.sh
+# wget -O /tmp/podkop-subscription-install.sh "https://raw.githubusercontent.com/r333oe/openwrt-podkop-subscription/main/install.sh?v=12" && sh /tmp/podkop-subscription-install.sh
 set -eu
 
 RAW="https://raw.githubusercontent.com/r333oe/openwrt-podkop-subscription/main/luci-app-podkop-subscription"
@@ -43,7 +43,7 @@ install_one() {
 		cp "$SRC/$rel" "$dest"
 	else
 		echo "Скачиваю $rel"
-		wget -O "$dest" "$RAW/$rel?v=11" || {
+		wget -O "$dest" "$RAW/$rel?v=12" || {
 			echo "Не удалось скачать $rel" >&2
 			exit 1
 		}
@@ -79,7 +79,13 @@ install_one root/usr/libexec/rpcd/podkop-subscription /usr/libexec/rpcd/podkop-s
 install_one root/etc/init.d/podkop-subscription /etc/init.d/podkop-subscription 755
 install_one root/usr/share/luci/menu.d/luci-app-podkop-subscription.json /usr/share/luci/menu.d/luci-app-podkop-subscription.json 644
 install_one root/usr/share/rpcd/acl.d/luci-app-podkop-subscription.json /usr/share/rpcd/acl.d/luci-app-podkop-subscription.json 644
-install_one htdocs/luci-static/resources/view/podkop-subscription/subscribe.js /www/luci-static/resources/view/podkop-subscription/subscribe.js 644
+install_one htdocs/luci-static/resources/view/podkop-subscription/v12.js /www/luci-static/resources/view/podkop-subscription/v12.js 644
+cp -f /www/luci-static/resources/view/podkop-subscription/v12.js /www/luci-static/resources/view/podkop-subscription/subscribe.js
+chmod 644 /www/luci-static/resources/view/podkop-subscription/subscribe.js
+if ! grep -q "interface v12" /www/luci-static/resources/view/podkop-subscription/v12.js; then
+	echo "Поставилась старая страница LuCI" >&2
+	exit 1
+fi
 
 if [ ! -f /etc/config/podkop-subscription ]; then
 	install_one root/etc/config/podkop-subscription /etc/config/podkop-subscription 644
@@ -91,12 +97,14 @@ chmod 700 /etc/podkop-subscription
 /etc/init.d/podkop-subscription enable
 /etc/init.d/podkop-subscription start
 /etc/init.d/rpcd restart >/dev/null 2>&1 || true
-rm -f /tmp/luci-indexcache /tmp/luci-modulecache/* 2>/dev/null || true
+rm -f /tmp/luci-indexcache /tmp/luci-indexcache.* 2>/dev/null || true
+rm -rf /tmp/luci-modulecache 2>/dev/null || true
 
 echo ""
-echo "Установлено. Разбор: parser-build 11"
+echo "Установлено. Разбор: parser-build 11. Страница: interface v12"
 echo "LuCI: Services -> Подписка Podkop"
-echo "Выйдите из LuCI, зайдите снова и обновите страницу через Ctrl+F5."
+echo "Раздел «Трафик за месяц» стоит над блоком «Настройки»."
+echo "Обновите страницу клавишей F5 или зайдите в LuCI заново."
 echo ""
 exit 0
 __PODKOP_PARSER_PAYLOAD__
