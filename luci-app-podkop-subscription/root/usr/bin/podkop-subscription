@@ -1,5 +1,5 @@
 #!/bin/sh
-# parser-build 8
+# parser-build 9
 # Fetch a VPN subscription and write supported proxy links into Podkop.
 set -f
 
@@ -96,20 +96,64 @@ read_urls() {
 	while IFS= read -r line || [ -n "$line" ]; do
 		case "$line" in
 			"$CFG.main.url="*)
-				val=${line#"$CFG.main.url="}
-				case "$val" in
-					\'*\')
-						val=${val#\'}
-						val=${val%\'}
-						;;
-				esac
-				[ -n "$val" ] || continue
-				printf '%s\n' "$val" >> "$dest"
+				parse_uci_url_line "$line" >> "$dest"
 				;;
 		esac
 	done < "$showf"
 	rm -f "$showf"
 	[ -s "$dest" ]
+}
+
+parse_uci_url_line() {
+	printf '%s\n' "$1" | awk '
+	{
+		line = $0
+		sub(/^[^=]*=/, "", line)
+		q = sprintf("%c", 39)
+		bs = sprintf("%c", 92)
+		esc = q bs q q
+		n = length(line)
+		i = 1
+		while (i <= n) {
+			c = substr(line, i, 1)
+			if (c == " " || c == "\t") {
+				i++
+				continue
+			}
+			if (c == q) {
+				i++
+				val = ""
+				while (i <= n) {
+					c = substr(line, i, 1)
+					if (c == q) {
+						if (substr(line, i, 4) == esc) {
+							val = val q
+							i += 4
+							continue
+						}
+						i++
+						break
+					}
+					val = val c
+					i++
+				}
+				if (val != "")
+					print val
+			} else {
+				val = ""
+				while (i <= n) {
+					c = substr(line, i, 1)
+					if (c == " " || c == "\t")
+						break
+					val = val c
+					i++
+				}
+				if (val != "")
+					print val
+			}
+		}
+	}
+	'
 }
 
 validate_settings() {
@@ -960,6 +1004,12 @@ run_self_test() {
 	[ "$COUNT" -eq 1 ] || { printf 'plain filter failed: %s\n' "$COUNT"; exit 1; }
 	grep -q 'Amsterdam' "$LINKS" || { printf 'fragment missing\n'; exit 1; }
 	grep -q 'bad.example' "$LINKS" && { printf 'unsafe link kept\n'; exit 1; }
+
+	parsed=$(parse_uci_url_line "podkop-subscription.main.url='https://a.example/one' 'https://b.example/two?x=1&y=2'")
+	printf '%s\n' "$parsed" | grep -q '^https://a.example/one$' || { printf 'url 1 parse failed\n'; exit 1; }
+	printf '%s\n' "$parsed" | grep -q '^https://b.example/two?x=1&y=2$' || { printf 'url 2 parse failed\n%s\n' "$parsed"; exit 1; }
+	count=$(printf '%s\n' "$parsed" | grep -c '^https://')
+	[ "$count" -eq 2 ] || { printf 'url count %s\n' "$count"; exit 1; }
 
 	IGNORE_RU=1
 	IGNORE_AUTO=1
