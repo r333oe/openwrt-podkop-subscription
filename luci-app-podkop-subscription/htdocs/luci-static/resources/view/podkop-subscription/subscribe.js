@@ -30,7 +30,7 @@ function optionValue(map, name) {
 }
 
 function saveForm(map) {
-	var names = [ 'url', 'target', 'mode', 'server', 'only_vless', 'restart', 'interval', 'user_agent' ];
+	var names = [ 'url', 'target', 'mode', 'server', 'only_vless', 'restart', 'interval', 'user_agent', 'hwid' ];
 	if (!uci.get('podkop-subscription', 'main'))
 		uci.add('podkop-subscription', 'subscription', 'main');
 
@@ -123,6 +123,12 @@ return view.extend({
 		o.placeholder = 'v2rayNG/1.8.29';
 		o.default = 'v2rayNG/1.8.29';
 		o.rmempty = false;
+
+		o = s.option(form.Value, 'hwid', _('HWID'),
+			_('Код устройства, который панель подписки ждёт в заголовке x-hwid. Пустое поле — роутер сам создаст постоянный код из MAC-адреса.'));
+		o.placeholder = _('создать автоматически');
+		o.rmempty = true;
+		o.optional = true;
 
 		function clearBox() {
 			while (outBox.firstChild)
@@ -250,6 +256,12 @@ return view.extend({
 			root.appendChild(E('div', {
 				'style': 'margin:0 0 1em; padding:.7em .9em; border-radius:4px; background:rgba(180,40,40,.15);'
 			}, _('Podkop не найден или страница открыта со старым входом в LuCI. Проверьте Podkop, выполните /etc/init.d/rpcd restart и зайдите в LuCI заново.')));
+		}
+
+		if (status.hwid) {
+			root.appendChild(E('div', {
+				'style': 'margin:0 0 1em; padding:.7em .9em; border-radius:4px; background:rgba(0,0,0,.06);'
+			}, _('С подпиской отправляется HWID: ') + status.hwid));
 		}
 
 		var self = this;

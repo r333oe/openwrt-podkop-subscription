@@ -59,6 +59,7 @@ load_settings() {
 	ONLY_VLESS=$(uci -q get "$CFG.main.only_vless" 2>/dev/null || true)
 	RESTART=$(uci -q get "$CFG.main.restart" 2>/dev/null || true)
 	UA=$(uci -q get "$CFG.main.user_agent" 2>/dev/null || true)
+	HWID_CUSTOM=$(uci -q get "$CFG.main.hwid" 2>/dev/null || true)
 	[ -n "$TARGET" ] || TARGET=main
 	[ -n "$MODE" ] || MODE=urltest
 	[ -n "$SERVER" ] || SERVER=0
@@ -101,6 +102,50 @@ validate_settings() {
 	case "$UA" in
 		*[\`\"\\]*) fail "User-Agent содержит недопустимые символы" ;;
 	esac
+	if [ -n "$HWID_CUSTOM" ]; then
+		case "$HWID_CUSTOM" in
+			*[!A-Za-z0-9_-]*) fail "HWID может содержать только латинские буквы, цифры, _ и -" ;;
+		esac
+		if [ "${#HWID_CUSTOM}" -lt 8 ] || [ "${#HWID_CUSTOM}" -gt 128 ]; then
+			fail "HWID должен быть от 8 до 128 символов"
+		fi
+	fi
+}
+
+ensure_hwid() {
+	local mac model seed
+	if [ -n "$HWID_CUSTOM" ]; then
+		HWID=$HWID_CUSTOM
+	else
+		mkdir -p "$STATE_DIR"
+		chmod 700 "$STATE_DIR" 2>/dev/null || true
+		if [ -s "$STATE_DIR/hwid" ]; then
+			HWID=$(tr -cd '0-9a-f' < "$STATE_DIR/hwid" | cut -c1-32)
+		fi
+		if [ -z "$HWID" ]; then
+			mac=$(cat /sys/class/net/br-lan/address 2>/dev/null || true)
+			[ -n "$mac" ] || mac=$(cat /sys/class/net/eth0/address 2>/dev/null || true)
+			model=$(cat /tmp/sysinfo/model 2>/dev/null || true)
+			seed="${mac}|${model}|podkop-subscription"
+			if command -v md5sum >/dev/null 2>&1; then
+				HWID=$(printf '%s' "$seed" | md5sum | awk '{print $1}')
+			elif command -v md5 >/dev/null 2>&1; then
+				HWID=$(printf '%s' "$seed" | md5 | awk '{print $NF}')
+			else
+				fail "Не найден md5sum, идентификатор устройства не создать"
+			fi
+			HWID=$(printf '%s' "$HWID" | tr -cd '0-9a-f' | cut -c1-32)
+			[ -n "$HWID" ] || fail "Не удалось создать HWID"
+			printf '%s\n' "$HWID" > "$STATE_DIR/hwid"
+			chmod 600 "$STATE_DIR/hwid"
+		fi
+	fi
+	MODEL=$(cat /tmp/sysinfo/model 2>/dev/null || printf '%s' 'OpenWrt')
+	MODEL=$(printf '%s' "$MODEL" | tr -d '\r\n"\\' | cut -c1-80)
+	[ -n "$MODEL" ] || MODEL=OpenWrt
+	KERNEL=$(uname -r 2>/dev/null || printf '%s' 'OpenWrt')
+	KERNEL=$(printf '%s' "$KERNEL" | tr -d '\r\n"\\' | cut -c1-40)
+	[ -n "$KERNEL" ] || KERNEL=OpenWrt
 }
 
 require_tools() {
@@ -200,23 +245,35 @@ classify_error() {
 	if grep -a -q '"outbounds"' "$WORKDIR/body" "$WORKDIR/text" 2>/dev/null; then
 		fail "Это конфиг sing-box JSON, в нём нет списка vless://."
 	fi
+	if grep -a -q -F 'HWID' "$WORKDIR/body" "$WORKDIR/text" 2>/dev/null; then
+		fail "Панель не приняла идентификатор устройства. Отправлен HWID: $HWID"
+	fi
 	fail "В ответе не нашлось ссылок. Проверьте ссылку и User-Agent."
+}
+
+run_curl() {
+	curl "$@" \
+		-A "$UA" \
+		-H "x-hwid: $HWID" \
+		-H "x-device-os: OpenWrt" \
+		-H "x-ver-os: $KERNEL" \
+		-H "x-device-model: $MODEL" \
+		-o "$RAW" \
+		"$URL"
 }
 
 fetch_body() {
 	local rc
 	RAW=$WORKDIR/raw
-	curl -fsL \
+	ensure_hwid
+	run_curl -fsL \
 		--proto '=http,https' \
 		--proto-redir '=http,https' \
 		--max-time 30 \
-		--max-filesize 2097152 \
-		-A "$UA" \
-		-o "$RAW" \
-		"$URL"
+		--max-filesize 2097152
 	rc=$?
 	if [ "$rc" -eq 2 ]; then
-		curl -fsL --max-time 30 -A "$UA" -o "$RAW" "$URL"
+		run_curl -fsL --max-time 30
 		rc=$?
 	fi
 	case "$rc" in
@@ -557,6 +614,8 @@ cmd_cron_sync() {
 
 cmd_status() {
 	command -v jq >/dev/null 2>&1 || fail "Не найден jq"
+	load_settings
+	ensure_hwid
 	secfile=$(mktemp /tmp/podkop-sub-sec.XXXXXX) || fail "Не удалось создать временный файл"
 	uci show podkop 2>/dev/null | sed -n 's/^podkop\.\([A-Za-z0-9_]*\)=section$/\1/p' > "$secfile" || true
 	if [ -s "$secfile" ]; then
@@ -580,7 +639,8 @@ cmd_status() {
 		--argjson podkop "$podkop" \
 		--argjson sections "$sections" \
 		--argjson state "$state" \
-		'{ok:$ok, podkop:$podkop, sections:$sections, state:$state}'
+		--arg hwid "$HWID" \
+		'{ok:$ok, podkop:$podkop, sections:$sections, state:$state, hwid:$hwid}'
 }
 
 run_self_test() {
