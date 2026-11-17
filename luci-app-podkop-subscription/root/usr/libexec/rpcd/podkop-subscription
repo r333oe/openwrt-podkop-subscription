@@ -1,0 +1,41 @@
+#!/bin/sh
+
+case "$1" in
+	list)
+		cat <<'EOF'
+{
+	"status": {},
+	"preview": {},
+	"apply": {
+		"server": "str"
+	},
+	"cron_sync": {}
+}
+EOF
+		;;
+	call)
+		case "$2" in
+			status)
+				cat >/dev/null
+				exec /usr/bin/podkop-subscription status
+				;;
+			preview)
+				cat >/dev/null
+				exec /usr/bin/podkop-subscription preview
+				;;
+			apply)
+				input=$(cat)
+				server=$(printf '%s' "$input" | jsonfilter -e '@.server' 2>/dev/null || true)
+				case "$server" in
+					''|null) exec /usr/bin/podkop-subscription apply ;;
+					*[!0-9]*) exec /usr/bin/podkop-subscription apply ;;
+					*) exec /usr/bin/podkop-subscription apply "$server" ;;
+				esac
+				;;
+			cron_sync)
+				cat >/dev/null
+				exec /usr/bin/podkop-subscription cron-sync
+				;;
+		esac
+		;;
+esac

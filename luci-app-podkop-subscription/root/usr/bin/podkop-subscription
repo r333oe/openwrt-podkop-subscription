@@ -1,0 +1,637 @@
+#!/bin/sh
+# Fetch a VPN subscription and write supported proxy links into Podkop.
+set -f
+
+STATE_DIR=/etc/podkop-subscription
+STATE_FILE=$STATE_DIR/state.json
+CRON_FILE=/etc/crontabs/root
+CFG=podkop-subscription
+
+APPLYING=0
+COMMITTED=0
+OWN_LOCK=0
+LOCKDIR=
+WORKDIR=
+
+fail() {
+	local esc
+	logger -t podkop-subscription "$1" 2>/dev/null || true
+	esc=$(printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g')
+	printf '%s\n' "{\"ok\":false,\"error\":\"$esc\"}"
+	exit 0
+}
+
+cleanup() {
+	if [ "$APPLYING" = 1 ] && [ "$COMMITTED" != 1 ]; then
+		uci revert podkop >/dev/null 2>&1 || true
+	fi
+	[ -n "$WORKDIR" ] && rm -rf "$WORKDIR"
+	if [ "$OWN_LOCK" = 1 ]; then
+		rm -rf "$LOCKDIR"
+	fi
+}
+
+with_lock() {
+	local dir old
+	dir=/var/lock/podkop-subscription
+	if mkdir "$dir" 2>/dev/null; then
+		printf '%s\n' "$$" > "$dir/pid"
+		LOCKDIR=$dir
+		OWN_LOCK=1
+		return 0
+	fi
+	old=$(cat "$dir/pid" 2>/dev/null || true)
+	if [ -n "$old" ] && kill -0 "$old" 2>/dev/null; then
+		fail "Уже выполняется другое обновление"
+	fi
+	rm -rf "$dir"
+	mkdir "$dir" 2>/dev/null || fail "Не удалось захватить блокировку"
+	printf '%s\n' "$$" > "$dir/pid"
+	LOCKDIR=$dir
+	OWN_LOCK=1
+}
+
+load_settings() {
+	URL=$(uci -q get "$CFG.main.url" 2>/dev/null || true)
+	TARGET=$(uci -q get "$CFG.main.target" 2>/dev/null || true)
+	MODE=$(uci -q get "$CFG.main.mode" 2>/dev/null || true)
+	SERVER=$(uci -q get "$CFG.main.server" 2>/dev/null || true)
+	ONLY_VLESS=$(uci -q get "$CFG.main.only_vless" 2>/dev/null || true)
+	RESTART=$(uci -q get "$CFG.main.restart" 2>/dev/null || true)
+	UA=$(uci -q get "$CFG.main.user_agent" 2>/dev/null || true)
+	[ -n "$TARGET" ] || TARGET=main
+	[ -n "$MODE" ] || MODE=urltest
+	[ -n "$SERVER" ] || SERVER=0
+	[ -n "$UA" ] || UA='v2rayNG/1.8.29'
+	case "$ONLY_VLESS" in
+		0) ONLY_VLESS=0 ;;
+		*) ONLY_VLESS=1 ;;
+	esac
+	case "$RESTART" in
+		0) RESTART=0 ;;
+		*) RESTART=1 ;;
+	esac
+	case "$SERVER" in
+		*[!0-9]*) SERVER=0 ;;
+	esac
+}
+
+validate_settings() {
+	case "$URL" in
+		http://*|https://*) ;;
+		*) fail "Укажите ссылку http:// или https:// и сохраните настройки" ;;
+	esac
+	case "$URL" in
+		*[[:space:]]*) fail "В ссылке подписки не должно быть пробелов" ;;
+	esac
+	case "$TARGET" in
+		*[!A-Za-z0-9_]*) fail "Некорректное имя секции Podkop" ;;
+	esac
+	case "$MODE" in
+		url|urltest|selector) ;;
+		*) fail "Неизвестный режим записи" ;;
+	esac
+	if [ "${#UA}" -gt 200 ]; then
+		fail "User-Agent слишком длинный"
+	fi
+	case "$UA" in
+		*[[:space:]]*) ;;
+		*) ;;
+	esac
+	case "$UA" in
+		*[\`\"\\]*) fail "User-Agent содержит недопустимые символы" ;;
+	esac
+}
+
+require_tools() {
+	command -v curl >/dev/null 2>&1 || fail "Не найден curl"
+	command -v jq >/dev/null 2>&1 || fail "Не найден jq"
+	command -v base64 >/dev/null 2>&1 || fail "Не найден base64"
+	command -v uci >/dev/null 2>&1 || fail "Не найден uci"
+}
+
+require_section() {
+	local typ
+	typ=$(uci -q get "podkop.$TARGET" 2>/dev/null || true)
+	[ "$typ" = "section" ] || fail "Секция Podkop «$TARGET» не найдена"
+}
+
+is_gzip() {
+	printf '\037\213' > "$WORKDIR/gzmagic"
+	dd if="$1" of="$WORKDIR/gzhead" bs=2 count=1 2>/dev/null || return 1
+	cmp -s "$WORKDIR/gzmagic" "$WORKDIR/gzhead"
+}
+
+strip_bom() {
+	local src dst
+	src=$1
+	dst=$2
+	printf '\357\273\277' > "$WORKDIR/bom"
+	dd if="$src" of="$WORKDIR/bomhead" bs=3 count=1 2>/dev/null || true
+	if cmp -s "$WORKDIR/bom" "$WORKDIR/bomhead"; then
+		dd if="$src" of="$dst" bs=3 skip=1 2>/dev/null || return 1
+	else
+		cp "$src" "$dst" || return 1
+	fi
+}
+
+is_base64_file() {
+	local len mod filtered
+	tr -d '\r\n\t ' < "$1" | tr '_-' '/+' > "$WORKDIR/b64body" || return 1
+	len=$(( $(wc -c < "$WORKDIR/b64body") ))
+	[ "$len" -ge 16 ] || return 1
+	mod=$((len % 4))
+	[ "$mod" -ne 1 ] || return 1
+	filtered=$(( $(tr -cd 'A-Za-z0-9+/=' < "$WORKDIR/b64body" | wc -c) ))
+	[ "$len" -eq "$filtered" ] || return 1
+	return 0
+}
+
+decode_base64() {
+	local dst len mod
+	dst=$1
+	len=$(( $(wc -c < "$WORKDIR/b64body") ))
+	mod=$((len % 4))
+	cp "$WORKDIR/b64body" "$WORKDIR/b64pad" || return 1
+	case $mod in
+		2) printf '==' >> "$WORKDIR/b64pad" ;;
+		3) printf '=' >> "$WORKDIR/b64pad" ;;
+	esac
+	base64 -d "$WORKDIR/b64pad" > "$dst" 2>/dev/null || return 1
+	[ -s "$dst" ] || return 1
+	return 0
+}
+
+has_share_link() {
+	grep -a -q -E '(vless|vmess|trojan|ss|hy2|hysteria2|socks4|socks5|socks)://' "$1"
+}
+
+normalize() {
+	local src dst depth
+	src=$1
+	dst=$2
+	depth=$3
+	[ "$depth" -lt 4 ] || return 1
+	if is_gzip "$src"; then
+		gzip -dc "$src" > "$src.gunz" || return 1
+		normalize "$src.gunz" "$dst" $((depth + 1))
+		return $?
+	fi
+	if has_share_link "$src"; then
+		cp "$src" "$dst" || return 1
+		return 0
+	fi
+	if is_base64_file "$src"; then
+		decode_base64 "$src.dec" || return 1
+		normalize "$src.dec" "$dst" $((depth + 1))
+		return $?
+	fi
+	cp "$src" "$dst" 2>/dev/null || true
+	return 1
+}
+
+classify_error() {
+	if grep -a -q -i '<html' "$WORKDIR/body" "$WORKDIR/text" 2>/dev/null; then
+		fail "Сервер вернул страницу HTML, а не подписку. Проверьте ссылку."
+	fi
+	if grep -a -q -E 'proxies:|proxy-groups:' "$WORKDIR/body" "$WORKDIR/text" 2>/dev/null; then
+		fail "Это подписка Clash. Поставьте User-Agent v2rayNG/1.8.29: тогда сервис обычно отдаёт список vless://."
+	fi
+	if grep -a -q '"outbounds"' "$WORKDIR/body" "$WORKDIR/text" 2>/dev/null; then
+		fail "Это конфиг sing-box JSON, в нём нет списка vless://."
+	fi
+	fail "В ответе не нашлось ссылок. Проверьте ссылку и User-Agent."
+}
+
+fetch_body() {
+	local rc
+	RAW=$WORKDIR/raw
+	curl -fsL \
+		--proto '=http,https' \
+		--proto-redir '=http,https' \
+		--max-time 30 \
+		--max-filesize 2097152 \
+		-A "$UA" \
+		-o "$RAW" \
+		"$URL"
+	rc=$?
+	if [ "$rc" -eq 2 ]; then
+		curl -fsL --max-time 30 -A "$UA" -o "$RAW" "$URL"
+		rc=$?
+	fi
+	case "$rc" in
+		0) ;;
+		6) fail "Не удалось разрешить имя сервера подписки" ;;
+		7|28) fail "Сервер подписки не ответил вовремя" ;;
+		22) fail "Сервер подписки вернул ошибку HTTP" ;;
+		35|51|60) fail "Ошибка TLS. Проверьте дату на роутере и пакет ca-bundle" ;;
+		63) fail "Ответ подписки больше 2 МБ" ;;
+		*) fail "Не удалось скачать подписку" ;;
+	esac
+	[ -s "$RAW" ] || fail "Сервер подписки вернул пустой ответ"
+}
+
+prepare_text() {
+	strip_bom "$RAW" "$WORKDIR/body" || fail "Не удалось прочитать ответ подписки"
+	if normalize "$WORKDIR/body" "$WORKDIR/text" 0; then
+		return 0
+	fi
+	[ -f "$WORKDIR/text" ] || cp "$WORKDIR/body" "$WORKDIR/text"
+	classify_error
+}
+
+urldecode() {
+	printf '%s' "$1" | awk '
+		function hex(c) {
+			c = tolower(c)
+			if (c >= "0" && c <= "9")
+				return index("0123456789", c) - 1
+			return index("abcdef", c) + 9
+		}
+		{
+			s = $0
+			out = ""
+			while (match(s, /%[0-9A-Fa-f][0-9A-Fa-f]/)) {
+				out = out substr(s, 1, RSTART - 1)
+				h = substr(s, RSTART + 1, 2)
+				out = out sprintf("%c", hex(substr(h, 1, 1)) * 16 + hex(substr(h, 2, 1)))
+				s = substr(s, RSTART + RLENGTH)
+			}
+			printf "%s%s", out, s
+		}
+	'
+}
+
+extract_links() {
+	LINKS=$WORKDIR/links
+	grep -a -oE "(vless|vmess|trojan|ss|hy2|hysteria2|socks4|socks5|socks)://[^[:space:]<>\"']+" \
+		"$WORKDIR/text" | awk '!seen[$0]++' > "$WORKDIR/all" || true
+	: > "$LINKS"
+	: > "$WORKDIR/skipped"
+	while IFS= read -r link || [ -n "$link" ]; do
+		[ -n "$link" ] || continue
+		link=$(printf '%s' "$link" | tr -d '\r')
+		scheme=${link%%://*}
+		case "$scheme" in
+			vless) ;;
+			ss|trojan|hy2|hysteria2|socks|socks4|socks5)
+				if [ "$ONLY_VLESS" = 1 ]; then
+					printf '%s\n' "$scheme" >> "$WORKDIR/skipped"
+					continue
+				fi
+				;;
+			*)
+				printf '%s\n' "$scheme" >> "$WORKDIR/skipped"
+				continue
+				;;
+		esac
+		case "$link" in
+			*'$'*|*\\*|*'`'*|*'"'*|*\'*)
+				printf '%s\n' unsafe >> "$WORKDIR/skipped"
+				continue
+				;;
+		esac
+		printf '%s\n' "$link" >> "$LINKS"
+	done < "$WORKDIR/all"
+	COUNT=$(( $(wc -l < "$LINKS") ))
+	SKIPPED=$(( $(wc -l < "$WORKDIR/skipped") ))
+	TOTAL=$COUNT
+	TRUNCATED=0
+	if [ "$COUNT" -gt 200 ]; then
+		sed -i '201,$d' "$LINKS"
+		COUNT=200
+		TRUNCATED=1
+	fi
+}
+
+build_tsv() {
+	TSV=$WORKDIR/servers.tsv
+	: > "$TSV"
+	i=0
+	while IFS= read -r link || [ -n "$link" ]; do
+		[ -n "$link" ] || continue
+		scheme=${link%%://*}
+		rest=${link#*://}
+		frag=
+		case "$link" in
+			*'#'*) frag=${link##*'#'} ;;
+		esac
+		norest=${rest%%#*}
+		norest=${norest%%\?*}
+		case "$norest" in
+			*@*) hostport=${norest##*@} ;;
+			*) hostport=$norest ;;
+		esac
+		host=${hostport%%:*}
+		if [ -n "$frag" ]; then
+			name=$(urldecode "$frag")
+		else
+			name=$host
+		fi
+		[ -n "$name" ] || name=$host
+		name=$(printf '%.80s' "$name" | tr '\t\r\n' '   ')
+		host=$(printf '%.80s' "$host" | tr '\t\r\n' '   ')
+		printf '%s\t%s\t%s\t%s\n' "$i" "$scheme" "$host" "$name" >> "$TSV"
+		i=$((i + 1))
+	done < "$LINKS"
+}
+
+servers_json() {
+	if [ ! -s "$TSV" ]; then
+		printf '%s' '[]'
+		return 0
+	fi
+	jq -R -s '
+		split("\n")
+		| map(select(length > 0) | split("\t"))
+		| map({
+			index: (.[0] | tonumber),
+			scheme: .[1],
+			host: .[2],
+			name: (.[3] // "")
+		})
+	' "$TSV"
+}
+
+mode_label() {
+	case "$MODE" in
+		url) printf '%s' 'одна ссылка' ;;
+		urltest) printf '%s' 'URLTest' ;;
+		selector) printf '%s' 'Selector' ;;
+	esac
+}
+
+ensure_have_links() {
+	if [ "$TOTAL" -gt 0 ]; then
+		return 0
+	fi
+	if [ "$SKIPPED" -gt 0 ] && [ "$ONLY_VLESS" = 1 ]; then
+		fail "Ссылок VLESS нет. Пропущено $SKIPPED других. Снимите «Только VLESS», если нужны Shadowsocks, Trojan или Hysteria2."
+	fi
+	fail "В подписке не нашлось подходящих ссылок."
+}
+
+fetch_all() {
+	umask 077
+	WORKDIR=$(mktemp -d /tmp/podkop-sub.XXXXXX) || fail "Не удалось создать временный каталог"
+	fetch_body
+	prepare_text
+	extract_links
+	ensure_have_links
+	build_tsv
+}
+
+emit_result() {
+	message=$1
+	warning=$2
+	preview=$3
+	servers=$(servers_json) || fail "Не удалось разобрать имена серверов"
+	now=$(date '+%Y-%m-%d %H:%M' 2>/dev/null || date)
+	mkdir -p "$STATE_DIR"
+	chmod 700 "$STATE_DIR"
+	if [ "$preview" != 1 ]; then
+		jq -n \
+			--arg time "$now" \
+			--arg message "$message" \
+			--arg warning "$warning" \
+			--arg mode "$MODE" \
+			--arg target "$TARGET" \
+			--argjson count "$COUNT" \
+			--argjson skipped "$SKIPPED" \
+			--argjson truncated "$TRUNCATED" \
+			--argjson servers "$servers" \
+			'{time:$time, message:$message, warning:$warning, mode:$mode, target:$target, count:$count, skipped:$skipped, truncated:($truncated != 0), servers:$servers}' \
+			> "$STATE_FILE" || fail "Не удалось сохранить результат"
+		chmod 600 "$STATE_FILE"
+	fi
+	jq -n \
+		--argjson ok true \
+		--arg message "$message" \
+		--arg warning "$warning" \
+		--arg mode "$MODE" \
+		--arg target "$TARGET" \
+		--argjson count "$COUNT" \
+		--argjson skipped "$SKIPPED" \
+		--argjson truncated "$TRUNCATED" \
+		--argjson preview "$preview" \
+		--argjson servers "$servers" \
+		'{ok:$ok, message:$message, warning:$warning, mode:$mode, target:$target, count:$count, skipped:$skipped, truncated:($truncated != 0), preview:($preview != 0), servers:$servers}'
+}
+
+write_podkop() {
+	require_section
+	APPLYING=1
+	uci -q delete "podkop.${TARGET}.proxy_string" || true
+	uci -q delete "podkop.${TARGET}.urltest_proxy_links" || true
+	uci -q delete "podkop.${TARGET}.selector_proxy_links" || true
+	uci set "podkop.${TARGET}.connection_type=proxy" || fail "Не удалось изменить секцию Podkop"
+	uci set "podkop.${TARGET}.proxy_config_type=${MODE}" || fail "Не удалось изменить тип конфигурации Podkop"
+
+	if [ "$MODE" = url ]; then
+		line_no=$((SERVER + 1))
+		chosen=$(sed -n "${line_no}p" "$LINKS")
+		[ -n "$chosen" ] || fail "Сервер с номером $line_no не найден. Сначала покажите список и выберите сервер."
+		uci set "podkop.${TARGET}.proxy_string=${chosen}" || fail "Не удалось записать ссылку в Podkop"
+		COUNT=1
+		sed -n "${line_no}p" "$TSV" > "$WORKDIR/one.tsv"
+		TSV=$WORKDIR/one.tsv
+	else
+		field=urltest_proxy_links
+		[ "$MODE" = selector ] && field=selector_proxy_links
+		while IFS= read -r link || [ -n "$link" ]; do
+			[ -n "$link" ] || continue
+			uci add_list "podkop.${TARGET}.${field}=${link}" || fail "Не удалось записать ссылку в Podkop"
+		done < "$LINKS"
+	fi
+	uci commit podkop || fail "Не удалось сохранить конфиг Podkop"
+	COMMITTED=1
+}
+
+restart_podkop() {
+	RESTART_RC=0
+	RESTART_TIMEOUT=0
+	if [ ! -x /etc/init.d/podkop ]; then
+		RESTART_RC=1
+		return
+	fi
+	/etc/init.d/podkop restart >/dev/null 2>&1 &
+	rpid=$!
+	i=0
+	while kill -0 "$rpid" 2>/dev/null; do
+		if [ "$i" -ge 20 ]; then
+			RESTART_TIMEOUT=1
+			return
+		fi
+		sleep 1
+		i=$((i + 1))
+	done
+	wait "$rpid" || RESTART_RC=$?
+}
+
+result_message() {
+	label=$(mode_label)
+	msg="Найдено ссылок: $COUNT."
+	if [ "$1" = apply ]; then
+		msg="В секцию $TARGET записано ссылок: $COUNT, режим $label."
+	fi
+	if [ "$TRUNCATED" = 1 ]; then
+		msg="$msg Из подписки взяты первые 200, всего было $TOTAL."
+	fi
+	if [ "$SKIPPED" -gt 0 ]; then
+		msg="$msg Пропущено: $SKIPPED."
+	fi
+	printf '%s' "$msg"
+}
+
+cmd_preview() {
+	load_settings
+	validate_settings
+	require_tools
+	trap cleanup EXIT
+	with_lock
+	fetch_all
+	msg=$(result_message preview)
+	msg="$msg В Podkop ничего не записано."
+	emit_result "$msg" "" 1
+}
+
+cmd_apply() {
+	load_settings
+	if [ -n "$SERVER_ARG" ]; then
+		case "$SERVER_ARG" in
+			*[!0-9]*) ;;
+			*) SERVER=$SERVER_ARG ;;
+		esac
+	fi
+	validate_settings
+	require_tools
+	trap cleanup EXIT
+	with_lock
+	fetch_all
+	write_podkop
+	warning=
+	if [ "$RESTART" = 1 ]; then
+		restart_podkop
+		if [ "$RESTART_TIMEOUT" = 1 ]; then
+			warning="Ссылки записаны. Перезапуск Podkop ещё идёт."
+		elif [ "$RESTART_RC" != 0 ]; then
+			warning="Ссылки записаны, но перезапуск Podkop завершился с ошибкой. Смотрите logread -e podkop"
+		fi
+	fi
+	sync_cron
+	msg=$(result_message apply)
+	if [ "$RESTART" = 1 ] && [ -z "$warning" ]; then
+		msg="$msg Podkop перезапущен."
+	fi
+	if [ "$RESTART" = 0 ]; then
+		msg="$msg Перезапуск выключен: служба Podkop сама подхватит ссылки после Restart."
+	fi
+	logger -t podkop-subscription "wrote $COUNT links into podkop.$TARGET ($MODE), skipped $SKIPPED" 2>/dev/null || true
+	emit_result "$msg" "$warning" 0
+}
+
+sync_cron() {
+	interval=$(uci -q get "$CFG.main.interval" 2>/dev/null || true)
+	mkdir -p /etc/crontabs
+	touch "$CRON_FILE"
+	sed -i '/# podkop-subscription begin/,/# podkop-subscription end/d' "$CRON_FILE" 2>/dev/null || true
+	sed -i '\#/usr/bin/podkop-subscription apply#d' "$CRON_FILE" 2>/dev/null || true
+	line=
+	case "$interval" in
+		6h) line='0 */6 * * * /usr/bin/podkop-subscription apply >/dev/null 2>&1' ;;
+		12h) line='0 */12 * * * /usr/bin/podkop-subscription apply >/dev/null 2>&1' ;;
+		24h) line='15 4 * * * /usr/bin/podkop-subscription apply >/dev/null 2>&1' ;;
+	esac
+	if [ -n "$line" ]; then
+		printf '%s\n%s\n%s\n' '# podkop-subscription begin' "$line" '# podkop-subscription end' >> "$CRON_FILE"
+	fi
+	if [ -x /etc/init.d/cron ]; then
+		/etc/init.d/cron reload >/dev/null 2>&1 || /etc/init.d/cron restart >/dev/null 2>&1 || true
+	fi
+}
+
+cmd_cron_sync() {
+	sync_cron
+	printf '%s\n' '{"ok":true}'
+}
+
+cmd_status() {
+	command -v jq >/dev/null 2>&1 || fail "Не найден jq"
+	secfile=$(mktemp /tmp/podkop-sub-sec.XXXXXX) || fail "Не удалось создать временный файл"
+	uci show podkop 2>/dev/null | sed -n 's/^podkop\.\([A-Za-z0-9_]*\)=section$/\1/p' > "$secfile" || true
+	if [ -s "$secfile" ]; then
+		sections=$(jq -R -s 'split("\n") | map(select(length > 0))' "$secfile")
+	else
+		sections='[]'
+	fi
+	rm -f "$secfile"
+	if [ -f "$STATE_FILE" ] && jq -e . "$STATE_FILE" >/dev/null 2>&1; then
+		state=$(cat "$STATE_FILE")
+	else
+		state=null
+	fi
+	if [ -x /etc/init.d/podkop ]; then
+		podkop=true
+	else
+		podkop=false
+	fi
+	jq -n \
+		--argjson ok true \
+		--argjson podkop "$podkop" \
+		--argjson sections "$sections" \
+		--argjson state "$state" \
+		'{ok:$ok, podkop:$podkop, sections:$sections, state:$state}'
+}
+
+run_self_test() {
+	WORKDIR=$(mktemp -d /tmp/podkop-sub-test.XXXXXX) || exit 1
+	trap 'rm -rf "$WORKDIR"' EXIT
+	ONLY_VLESS=1
+	plain=$WORKDIR/plain.txt
+	printf '%s\n' \
+		'vless://11111111-1111-1111-1111-111111111111@nl.example:443?encryption=none&security=tls&type=tcp&sni=nl.example#Amsterdam' \
+		'vmess://aabbcc' \
+		'ss://cmM0LW1kNTpwYXNz@1.2.3.4:8388#Shadow' \
+		'vless://11111111-1111-1111-1111-111111111111@bad.example:443?encryption=none&security=none&type=tcp#a$(id)' \
+		> "$plain"
+	cp "$plain" "$WORKDIR/text"
+	extract_links
+	[ "$COUNT" -eq 1 ] || { printf 'plain filter failed: %s\n' "$COUNT"; exit 1; }
+	grep -q 'Amsterdam' "$LINKS" || { printf 'fragment missing\n'; exit 1; }
+	grep -q 'bad.example' "$LINKS" && { printf 'unsafe link kept\n'; exit 1; }
+	build_tsv
+	grep -q 'Amsterdam' "$TSV" || { printf 'name missing\n'; exit 1; }
+	name=$(urldecode '%D0%9D%D0%B8%D0%B4%D0%B5%D1%80%D0%BB%D0%B0%D0%BD%D0%B4%D1%8B')
+	printf '%s' "$name" | grep -q 'Нидерланды' || { printf 'urldecode failed: %s\n' "$name"; exit 1; }
+
+	base64 "$plain" > "$WORKDIR/wrapped.b64"
+	RAW=$WORKDIR/wrapped.b64
+	prepare_text || { printf 'base64 decode failed\n'; exit 1; }
+	grep -q 'vless://11111111' "$WORKDIR/text" || { printf 'decoded text has no vless\n'; exit 1; }
+
+	gzip -c "$plain" | base64 > "$WORKDIR/gz.b64"
+	RAW=$WORKDIR/gz.b64
+	prepare_text || { printf 'gzip+base64 decode failed\n'; exit 1; }
+	grep -q 'Amsterdam' "$WORKDIR/text" || { printf 'gzip text missing name\n'; exit 1; }
+	printf '%s\n' OK
+}
+
+usage() {
+	printf '%s\n' 'Usage: podkop-subscription preview|apply [index]|status|cron-sync|self-test'
+}
+
+SERVER_ARG=
+case "$1" in
+	preview) cmd_preview ;;
+	apply)
+		SERVER_ARG=$2
+		cmd_apply
+		;;
+	status) cmd_status ;;
+	cron-sync) cmd_cron_sync ;;
+	self-test) run_self_test ;;
+	*)
+		usage
+		exit 1
+		;;
+esac

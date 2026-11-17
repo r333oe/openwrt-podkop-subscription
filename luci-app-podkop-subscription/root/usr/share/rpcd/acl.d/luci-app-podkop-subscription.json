@@ -1,0 +1,14 @@
+{
+	"luci-app-podkop-subscription": {
+		"description": "Download a VPN subscription and write links into Podkop",
+		"read": {
+			"uci": [ "podkop-subscription", "podkop" ],
+			"ubus": {
+				"podkop-subscription": [ "status", "preview", "apply", "cron_sync" ]
+			}
+		},
+		"write": {
+			"uci": [ "podkop-subscription" ]
+		}
+	}
+}

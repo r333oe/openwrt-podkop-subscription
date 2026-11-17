@@ -1,0 +1,14 @@
+{
+	"admin/services/podkop-subscription": {
+		"title": "Подписка Podkop",
+		"order": 61,
+		"action": {
+			"type": "view",
+			"path": "podkop-subscription/subscribe"
+		},
+		"depends": {
+			"acl": [ "luci-app-podkop-subscription" ],
+			"uci": { "podkop": true }
+		}
+	}
+}
