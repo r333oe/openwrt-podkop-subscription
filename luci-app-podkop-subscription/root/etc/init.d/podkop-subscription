@@ -5,6 +5,7 @@ STOP=10
 
 start() {
 	/usr/bin/podkop-subscription cron-sync >/dev/null 2>&1 || true
+	/usr/bin/podkop-subscription traffic-sample >/dev/null 2>&1 || true
 }
 
 reload() {

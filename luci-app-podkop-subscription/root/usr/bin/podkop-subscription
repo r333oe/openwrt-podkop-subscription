@@ -1,10 +1,12 @@
 #!/bin/sh
-# parser-build 10
+# parser-build 11
 # Fetch a VPN subscription and write supported proxy links into Podkop.
 set -f
 
 STATE_DIR=/etc/podkop-subscription
 STATE_FILE=$STATE_DIR/state.json
+TRAFFIC_FILE=$STATE_DIR/traffic.json
+ACCT_SIG=$STATE_DIR/acct.sig
 CRON_FILE=/etc/crontabs/root
 CFG=podkop-subscription
 
@@ -949,6 +951,8 @@ sync_cron() {
 	touch "$CRON_FILE"
 	sed -i '/# podkop-subscription begin/,/# podkop-subscription end/d' "$CRON_FILE" 2>/dev/null || true
 	sed -i '\#/usr/bin/podkop-subscription apply#d' "$CRON_FILE" 2>/dev/null || true
+	sed -i '/# podkop-subscription-traffic begin/,/# podkop-subscription-traffic end/d' "$CRON_FILE" 2>/dev/null || true
+	sed -i '\#/usr/bin/podkop-subscription traffic-sample#d' "$CRON_FILE" 2>/dev/null || true
 	line=
 	case "$interval" in
 		6h) line='0 */6 * * * /usr/bin/podkop-subscription apply >/dev/null 2>&1' ;;
@@ -958,6 +962,10 @@ sync_cron() {
 	if [ -n "$line" ]; then
 		printf '%s\n%s\n%s\n' '# podkop-subscription begin' "$line" '# podkop-subscription end' >> "$CRON_FILE"
 	fi
+	printf '%s\n%s\n%s\n' \
+		'# podkop-subscription-traffic begin' \
+		'*/5 * * * * /usr/bin/podkop-subscription traffic-sample >/dev/null 2>&1' \
+		'# podkop-subscription-traffic end' >> "$CRON_FILE"
 	if [ -x /etc/init.d/cron ]; then
 		/etc/init.d/cron reload >/dev/null 2>&1 || /etc/init.d/cron restart >/dev/null 2>&1 || true
 	fi
@@ -990,13 +998,15 @@ cmd_status() {
 	else
 		podkop=false
 	fi
+	traffic_json=$(cmd_traffic) || traffic_json='{"ok":false}'
 	jq -n \
 		--argjson ok true \
 		--argjson podkop "$podkop" \
 		--argjson sections "$sections" \
 		--argjson state "$state" \
+		--argjson traffic "$traffic_json" \
 		--arg hwid "$HWID" \
-		'{ok:$ok, podkop:$podkop, sections:$sections, state:$state, hwid:$hwid}'
+		'{ok:$ok, podkop:$podkop, sections:$sections, state:$state, hwid:$hwid, traffic:$traffic}'
 }
 
 run_self_test() {
@@ -1060,6 +1070,7 @@ run_self_test() {
 		printf '%s\n' OK
 		return 0
 	fi
+	traffic_self_test
 	cat > "$WORKDIR/singbox.json" <<'EOF'
 {
   "outbounds": [
@@ -1210,8 +1221,554 @@ EOF
 	printf '%s\n' OK
 }
 
+# Monthly totals. VPN bytes come from the sing-box Clash counters, which
+# reset when sing-box restarts. Direct bytes are forwarded packets Podkop
+# did not intercept. Deltas are stored on disk, so a restart does not
+# wipe the month.
+filter_ifaces() {
+	raw=$1
+	[ -n "$raw" ] || raw=br-lan
+	out=
+	for iface in $raw; do
+		case $iface in
+			*[!A-Za-z0-9._-]*) continue ;;
+		esac
+		case " $out " in
+			*" $iface "*) ;;
+			*) out="${out:+$out }$iface" ;;
+		esac
+	done
+	[ -n "$out" ] || out=br-lan
+	printf '%s' "$out"
+}
+
+read_ifaces() {
+	raw=
+	if command -v uci >/dev/null 2>&1; then
+		raw=$(uci -q get podkop.settings.source_network_interfaces 2>/dev/null || true)
+	fi
+	filter_ifaces "$raw"
+}
+
+is_ipv4() {
+	awk -v ip="$1" 'BEGIN {
+		n = split(ip, o, ".")
+		if (n != 4) exit 1
+		for (i = 1; i <= 4; i++) {
+			if (o[i] !~ /^[0-9]+$/) exit 1
+			if (length(o[i]) > 3) exit 1
+			if (o[i] + 0 > 255) exit 1
+		}
+		exit 0
+	}'
+}
+
+read_clash_file() {
+	up=$(jq -r 'if (.uploadTotal | type) == "number" then (.uploadTotal | floor) else empty end' "$1" 2>/dev/null || true)
+	down=$(jq -r 'if (.downloadTotal | type) == "number" then (.downloadTotal | floor) else empty end' "$1" 2>/dev/null || true)
+	up=${up%%.*}
+	down=${down%%.*}
+	case $up in
+		''|*[!0-9]*) return 1 ;;
+	esac
+	case $down in
+		''|*[!0-9]*) return 1 ;;
+	esac
+	VPN_UP=$up
+	VPN_DOWN=$down
+	VPN_OK=true
+	return 0
+}
+
+read_clash() {
+	VPN_UP=0
+	VPN_DOWN=0
+	VPN_OK=false
+	command -v curl >/dev/null 2>&1 || return 0
+	command -v jq >/dev/null 2>&1 || return 0
+	secret=
+	listen=
+	lan=
+	if command -v uci >/dev/null 2>&1; then
+		if [ "$(uci -q get podkop.settings.enable_yacd 2>/dev/null || true)" = 1 ]; then
+			secret=$(uci -q get podkop.settings.yacd_secret_key 2>/dev/null || true)
+			case $secret in
+				*[!A-Za-z0-9_-]*) secret= ;;
+			esac
+		fi
+		listen=$(uci -q get podkop.settings.service_listen_address 2>/dev/null || true)
+		lan=$(uci -q get network.lan.ipaddr 2>/dev/null || true)
+		lan=${lan%% *}
+	fi
+	addrs=
+	for cand in 127.0.0.1 "$listen" "$lan"; do
+		[ -n "$cand" ] || continue
+		is_ipv4 "$cand" || continue
+		case " $addrs " in
+			*" $cand "*) ;;
+			*) addrs="${addrs:+$addrs }$cand" ;;
+		esac
+	done
+	[ -n "$addrs" ] || return 0
+	tmp=$(mktemp /tmp/podkop-sub-clash.XXXXXX) || return 0
+	hdr=
+	if [ -n "$secret" ]; then
+		hdr=$(mktemp /tmp/podkop-sub-hdr.XXXXXX) || { rm -f "$tmp"; return 0; }
+		printf 'header = "Authorization: Bearer %s"\n' "$secret" > "$hdr"
+		chmod 600 "$hdr"
+	fi
+	for addr in $addrs; do
+		url="http://$addr:9090/connections"
+		if [ -n "$hdr" ] && curl -fsS -m 2 -o "$tmp" -K "$hdr" "$url" >/dev/null 2>&1; then
+			if read_clash_file "$tmp"; then
+				break
+			fi
+		fi
+		if curl -fsS -m 2 -o "$tmp" "$url" >/dev/null 2>&1; then
+			if read_clash_file "$tmp"; then
+				break
+			fi
+		fi
+	done
+	rm -f "$tmp" "$hdr"
+}
+
+read_counter() {
+	name=$1
+	val=
+	if command -v jq >/dev/null 2>&1; then
+		val=$(nft -j list counter inet PodkopSubAcct "$name" 2>/dev/null | jq -r '[.nftables[]?.counter?.bytes | numbers][0] // empty' 2>/dev/null || true)
+	fi
+	case $val in
+		''|*[!0-9]*)
+			val=$(nft list counter inet PodkopSubAcct "$name" 2>/dev/null | sed -n 's/.*bytes \([0-9][0-9]*\).*/\1/p' | head -n 1)
+			;;
+	esac
+	case $val in
+		''|*[!0-9]*) val=0 ;;
+	esac
+	printf '%s' "$val"
+}
+
+write_acct_rules() {
+	dest=$1
+	ifaces=$2
+	elems=
+	for iface in $ifaces; do
+		elems="${elems:+$elems, }\"$iface\""
+	done
+	cat > "$dest" << EOF
+table inet PodkopSubAcct {
+	counter direct_up {
+	}
+	counter direct_down {
+	}
+	set ifaces {
+		type ifname
+		elements = { $elems }
+	}
+	set localv4 {
+		type ipv4_addr
+		flags interval
+		auto-merge
+		elements = { 0.0.0.0/8, 10.0.0.0/8, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 240.0.0.0/4 }
+	}
+	set localv6 {
+		type ipv6_addr
+		flags interval
+		auto-merge
+		elements = { ::1, fc00::/7, fe80::/10, ff00::/8 }
+	}
+	chain acct {
+		type filter hook forward priority 0; policy accept;
+		iifname @ifaces ip daddr != @localv4 counter name "direct_up"
+		oifname @ifaces ip saddr != @localv4 counter name "direct_down"
+		iifname @ifaces ip6 daddr != @localv6 counter name "direct_up"
+		oifname @ifaces ip6 saddr != @localv6 counter name "direct_down"
+	}
+}
+EOF
+}
+
+acct_sync_ifaces() {
+	ifaces=$1
+	elems=
+	for iface in $ifaces; do
+		elems="${elems:+$elems, }\"$iface\""
+	done
+	nft flush set inet PodkopSubAcct ifaces >/dev/null 2>&1 || return 1
+	# shellcheck disable=SC2086
+	nft add element inet PodkopSubAcct ifaces "{ $elems }" >/dev/null 2>&1 || return 1
+}
+
+acct_prepare() {
+	DIRECT_UP=0
+	DIRECT_DOWN=0
+	DIRECT_OK=false
+	REBUILT=0
+	command -v nft >/dev/null 2>&1 || return 0
+	ifaces=$(read_ifaces)
+	sig="acct-v1 $ifaces"
+	saved=$(cat "$ACCT_SIG" 2>/dev/null || true)
+	complete=0
+	if nft list counter inet PodkopSubAcct direct_up >/dev/null 2>&1 \
+		&& nft list counter inet PodkopSubAcct direct_down >/dev/null 2>&1 \
+		&& nft list chain inet PodkopSubAcct acct >/dev/null 2>&1; then
+		complete=1
+		DIRECT_UP=$(read_counter direct_up)
+		DIRECT_DOWN=$(read_counter direct_down)
+	fi
+	case $saved in
+		"acct-v1 "*) version_ok=1 ;;
+		*) version_ok=0 ;;
+	esac
+	if [ "$complete" = 1 ] && [ "$version_ok" = 1 ] && [ "$saved" = "$sig" ]; then
+		DIRECT_OK=true
+		return 0
+	fi
+	if [ "$complete" = 1 ] && [ "$version_ok" = 1 ]; then
+		if acct_sync_ifaces "$ifaces"; then
+			mkdir -p "$STATE_DIR"
+			printf '%s\n' "$sig" > "$ACCT_SIG"
+			chmod 600 "$ACCT_SIG" 2>/dev/null || true
+			DIRECT_OK=true
+			return 0
+		fi
+	fi
+	rules=$(mktemp /tmp/podkop-sub-acct.XXXXXX) || return 0
+	write_acct_rules "$rules" "$ifaces" || { rm -f "$rules"; return 0; }
+	if ! nft -c -f "$rules" >/dev/null 2>&1; then
+		rm -f "$rules"
+		if [ "$complete" = 1 ]; then
+			DIRECT_OK=true
+		fi
+		logger -t podkop-subscription "traffic: nft rules were not accepted" 2>/dev/null || true
+		return 0
+	fi
+	nft delete table inet PodkopSubAcct >/dev/null 2>&1 || true
+	if ! nft -f "$rules" >/dev/null 2>&1; then
+		rm -f "$rules"
+		logger -t podkop-subscription "traffic: nft rules were not installed" 2>/dev/null || true
+		return 0
+	fi
+	rm -f "$rules"
+	mkdir -p "$STATE_DIR"
+	printf '%s\n' "$sig" > "$ACCT_SIG"
+	chmod 600 "$ACCT_SIG" 2>/dev/null || true
+	REBUILT=1
+	DIRECT_OK=true
+}
+
+flow_offload_enabled() {
+	command -v uci >/dev/null 2>&1 || return 1
+	uci show firewall 2>/dev/null | grep -Eq 'flow_offloading(_hw)?=["'\'']?1["'\'']?$'
+}
+
+traffic_fold() {
+	jq -n --argjson in "$1" '
+	def nz($x): $x // 0;
+	def take($ok; $cur_up; $cur_down; $seen; $last_up; $last_down; $tot_up; $tot_down):
+	  if $ok and ($seen | not) then
+	    {tot_up: $tot_up, tot_down: $tot_down,
+	     last_up: $cur_up, last_down: $cur_down, seen: true,
+	     add_up: 0, add_down: 0, reset_up: false, reset_down: false}
+	  elif $ok then
+	    {add_up: (if $cur_up < $last_up then $cur_up else $cur_up - $last_up end),
+	     add_down: (if $cur_down < $last_down then $cur_down else $cur_down - $last_down end),
+	     reset_up: ($cur_up < $last_up),
+	     reset_down: ($cur_down < $last_down),
+	     last_up: $cur_up, last_down: $cur_down, seen: true,
+	     tot_up: $tot_up, tot_down: $tot_down}
+	  else
+	    {tot_up: $tot_up, tot_down: $tot_down,
+	     last_up: $last_up, last_down: $last_down, seen: $seen,
+	     add_up: 0, add_down: 0, reset_up: false, reset_down: false}
+	  end;
+	def parked($add; $reset):
+	  if $reset then {old: 0, new: $add} else {old: $add, new: 0} end;
+	($in.state // {}) as $s
+	| take($in.vpn_ok; $in.vpn_up; $in.vpn_down; ($s.vpn_seen == true); nz($s.last_vpn_up); nz($s.last_vpn_down); nz($s.vpn_up); nz($s.vpn_down)) as $v
+	| take($in.direct_ok; $in.direct_up; $in.direct_down; ($s.direct_seen == true); nz($s.last_direct_up); nz($s.last_direct_down); nz($s.direct_up); nz($s.direct_down)) as $d
+	| ($s.month // "") as $stored
+	| ($stored != "" and $stored != $in.month) as $roll
+	| parked($v.add_up; $v.reset_up) as $vu
+	| parked($v.add_down; $v.reset_down) as $vd
+	| parked($d.add_up; $d.reset_up) as $du
+	| parked($d.add_down; $d.reset_down) as $dd
+	| (if $roll then nz($s.vpn_up) + $vu.old else 0 end) as $arch_vu
+	| (if $roll then nz($s.vpn_down) + $vd.old else 0 end) as $arch_vd
+	| (if $roll then nz($s.direct_up) + $du.old else 0 end) as $arch_du
+	| (if $roll then nz($s.direct_down) + $dd.old else 0 end) as $arch_dd
+	| (if $roll then
+	    (if ($arch_vu + $arch_vd + $arch_du + $arch_dd) > 0 then
+	      [{month: $stored, vpn_up: $arch_vu, vpn_down: $arch_vd, direct_up: $arch_du, direct_down: $arch_dd}] + ($s.history // [])
+	    else ($s.history // []) end)[:14]
+	  else ($s.history // []) end) as $history
+	| (if $roll then $vu.new else $v.tot_up + $v.add_up end) as $vpn_up
+	| (if $roll then $vd.new else $v.tot_down + $v.add_down end) as $vpn_down
+	| (if $roll then $du.new else $d.tot_up + $d.add_up end) as $direct_up
+	| (if $roll then $dd.new else $d.tot_down + $d.add_down end) as $direct_down
+	| {
+	    month: $in.month,
+	    since: (if $roll or (($s.since // "") == "") then $in.now else $s.since end),
+	    updated: $in.now,
+	    vpn_up: $vpn_up,
+	    vpn_down: $vpn_down,
+	    direct_up: $direct_up,
+	    direct_down: $direct_down,
+	    last_vpn_up: $v.last_up,
+	    last_vpn_down: $v.last_down,
+	    last_direct_up: $d.last_up,
+	    last_direct_down: $d.last_down,
+	    vpn_seen: $v.seen,
+	    direct_seen: $d.seen,
+	    vpn_ok: $in.vpn_ok,
+	    direct_ok: $in.direct_ok,
+	    flow_offload: $in.flow_offload,
+	    history: $history
+	  }
+'
+}
+
+traffic_view() {
+	jq -n --argjson s "$1" '
+		def nz($x): $x // 0;
+		def block($up; $down): {up: nz($up), down: nz($down), total: (nz($up) + nz($down))};
+		if $s == null then
+			{ok: true, empty: true, month: "", since: "", updated: "",
+			 vpn: block(0; 0), direct: block(0; 0),
+			 vpn_available: false, direct_available: false, flow_offload: false, previous: null}
+		else
+			($s.history // []) as $h
+			| {
+				ok: true,
+				empty: false,
+				month: ($s.month // ""),
+				since: ($s.since // ""),
+				updated: ($s.updated // ""),
+				vpn: block($s.vpn_up; $s.vpn_down),
+				direct: block($s.direct_up; $s.direct_down),
+				vpn_available: ($s.vpn_ok == true),
+				direct_available: ($s.direct_ok == true),
+				flow_offload: ($s.flow_offload == true),
+				previous: (if ($h | length) > 0 then
+					($h[0]) as $p | {
+						month: ($p.month // ""),
+						vpn: block($p.vpn_up; $p.vpn_down),
+						direct: block($p.direct_up; $p.direct_down)
+					}
+				else null end)
+			}
+		end
+	'
+}
+
+traffic_emit() {
+	local state
+	state=null
+	if [ -f "$TRAFFIC_FILE" ] && jq -e . "$TRAFFIC_FILE" >/dev/null 2>&1; then
+		state=$(cat "$TRAFFIC_FILE")
+	fi
+	traffic_view "$state"
+}
+
+ensure_traffic_cron() {
+	if [ -f "$CRON_FILE" ] && grep -q '# podkop-subscription-traffic begin' "$CRON_FILE" 2>/dev/null; then
+		return 0
+	fi
+	sync_cron
+}
+
+TRAFFIC_LOCK=
+
+traffic_lock_acquire() {
+	mkdir -p /var/lock 2>/dev/null || true
+	dir=/var/lock/podkop-subscription-traffic
+	if mkdir "$dir" 2>/dev/null; then
+		printf '%s\n' "$$" > "$dir/pid"
+		TRAFFIC_LOCK=$dir
+		return 0
+	fi
+	old=$(cat "$dir/pid" 2>/dev/null || true)
+	if [ -n "$old" ] && kill -0 "$old" 2>/dev/null; then
+		return 2
+	fi
+	rm -rf "$dir"
+	mkdir "$dir" 2>/dev/null || return 1
+	printf '%s\n' "$$" > "$dir/pid"
+	TRAFFIC_LOCK=$dir
+	return 0
+}
+
+traffic_lock_release() {
+	[ -n "$TRAFFIC_LOCK" ] || return 0
+	rm -rf "$TRAFFIC_LOCK"
+	TRAFFIC_LOCK=
+}
+
+traffic_update() {
+	local state month now payload new tmp
+	mkdir -p "$STATE_DIR"
+	chmod 700 "$STATE_DIR" 2>/dev/null || true
+	ensure_traffic_cron
+	read_clash
+	acct_prepare
+	FLOW=false
+	if flow_offload_enabled; then
+		FLOW=true
+	fi
+	state=null
+	if [ -f "$TRAFFIC_FILE" ] && jq -e . "$TRAFFIC_FILE" >/dev/null 2>&1; then
+		state=$(cat "$TRAFFIC_FILE")
+	fi
+	month=$(date '+%Y-%m' 2>/dev/null || date)
+	now=$(date '+%Y-%m-%d %H:%M' 2>/dev/null || date)
+	payload=$(jq -n \
+		--argjson state "$state" \
+		--argjson vpn_up "$VPN_UP" \
+		--argjson vpn_down "$VPN_DOWN" \
+		--argjson direct_up "$DIRECT_UP" \
+		--argjson direct_down "$DIRECT_DOWN" \
+		--argjson vpn_ok "$VPN_OK" \
+		--argjson direct_ok "$DIRECT_OK" \
+		--argjson flow_offload "$FLOW" \
+		--arg month "$month" \
+		--arg now "$now" \
+		'{state:$state, vpn_up:$vpn_up, vpn_down:$vpn_down, direct_up:$direct_up, direct_down:$direct_down, vpn_ok:$vpn_ok, direct_ok:$direct_ok, flow_offload:$flow_offload, month:$month, now:$now}') || return 1
+	new=$(traffic_fold "$payload") || return 1
+	if [ "$REBUILT" = 1 ]; then
+		new=$(printf '%s' "$new" | jq '.last_direct_up = 0 | .last_direct_down = 0') || return 1
+	fi
+	tmp="$TRAFFIC_FILE.tmp.$$"
+	printf '%s\n' "$new" > "$tmp" || { rm -f "$tmp"; return 1; }
+	if ! jq -e '.month and (.vpn_up | type == "number") and (.direct_up | type == "number")' "$tmp" >/dev/null 2>&1; then
+		rm -f "$tmp"
+		return 1
+	fi
+	mv "$tmp" "$TRAFFIC_FILE" || return 1
+	chmod 600 "$TRAFFIC_FILE" 2>/dev/null || true
+}
+
+cmd_traffic() {
+	local rc
+	command -v jq >/dev/null 2>&1 || fail "Не найден jq"
+	traffic_lock_acquire
+	rc=$?
+	if [ "$rc" != 2 ]; then
+		traffic_update || true
+		if [ "$rc" = 0 ]; then
+			traffic_lock_release
+		fi
+	fi
+	traffic_emit
+}
+
+traffic_self_test() {
+	is_ipv4 192.168.1.1 || { printf 'ipv4 lan failed\n'; exit 1; }
+	is_ipv4 127.0.0.1 || { printf 'ipv4 local failed\n'; exit 1; }
+	is_ipv4 0.0.0.0 || { printf 'ipv4 any failed\n'; exit 1; }
+	if is_ipv4 256.1.1.1; then
+		printf 'ipv4 accepted 256\n'
+		exit 1
+	fi
+	if is_ipv4 br-lan; then
+		printf 'ipv4 accepted a name\n'
+		exit 1
+	fi
+	if is_ipv4 1.2.3; then
+		printf 'ipv4 accepted a short address\n'
+		exit 1
+	fi
+	got=$(filter_ifaces 'br-lan bad;rm br-guest br-lan')
+	[ "$got" = "br-lan br-guest" ] || { printf 'iface filter failed: %s\n' "$got"; exit 1; }
+	got=$(filter_ifaces '')
+	[ "$got" = br-lan ] || { printf 'iface default failed: %s\n' "$got"; exit 1; }
+
+	printf '%s\n' '{"downloadTotal":9,"uploadTotal":5,"connections":[{"upload":1}]}' > "$WORKDIR/clash.json"
+	read_clash_file "$WORKDIR/clash.json" || { printf 'clash parse failed\n'; exit 1; }
+	[ "$VPN_UP" = 5 ] && [ "$VPN_DOWN" = 9 ] && [ "$VPN_OK" = true ] || {
+		printf 'clash values %s %s\n' "$VPN_UP" "$VPN_DOWN"
+		exit 1
+	}
+
+	write_acct_rules "$WORKDIR/acct.nft" "br-lan br-guest"
+	grep -q '"br-lan"' "$WORKDIR/acct.nft" || { printf 'nft iface missing\n'; exit 1; }
+	grep -q 'counter name "direct_up"' "$WORKDIR/acct.nft" || { printf 'nft counter missing\n'; exit 1; }
+	if [ "$(id -u)" -eq 0 ] && command -v nft >/dev/null 2>&1; then
+		nft -c -f "$WORKDIR/acct.nft" >/dev/null 2>&1 || { printf 'nft rules rejected\n'; exit 1; }
+	fi
+
+	in=$(jq -n '{state:null, vpn_up:100, vpn_down:200, direct_up:300, direct_down:400, vpn_ok:true, direct_ok:true, flow_offload:false, month:"2026-11", now:"2026-11-17 18:00"}')
+	got=$(traffic_fold "$in") || { printf 'traffic baseline error\n'; exit 1; }
+	printf '%s\n' "$got" | jq -e '.vpn_up == 0 and .vpn_down == 0 and .direct_up == 0 and .direct_down == 0 and .last_vpn_up == 100 and .last_vpn_down == 200 and .last_direct_up == 300 and .last_direct_down == 400 and .vpn_seen == true and .direct_seen == true and .since == "2026-11-17 18:00" and .history == []' >/dev/null || {
+		printf 'traffic baseline failed\n%s\n' "$got"
+		exit 1
+	}
+	base=$got
+	in=$(jq -n --argjson state "$base" '{state:$state, vpn_up:150, vpn_down:260, direct_up:300, direct_down:450, vpn_ok:true, direct_ok:true, flow_offload:false, month:"2026-11", now:"2026-11-17 18:05"}')
+	got=$(traffic_fold "$in") || { printf 'traffic delta error\n'; exit 1; }
+	printf '%s\n' "$got" | jq -e '.vpn_up == 50 and .vpn_down == 60 and .direct_up == 0 and .direct_down == 50 and .last_vpn_up == 150 and .since == "2026-11-17 18:00"' >/dev/null || {
+		printf 'traffic delta failed\n%s\n' "$got"
+		exit 1
+	}
+	view=$(traffic_view "$got") || { printf 'traffic view error\n'; exit 1; }
+	printf '%s\n' "$view" | jq -e '.ok == true and .vpn.total == 110 and .direct.total == 50 and .previous == null and .month == "2026-11"' >/dev/null || {
+		printf 'traffic view failed\n%s\n' "$view"
+		exit 1
+	}
+	mid=$got
+	in=$(jq -n --argjson state "$mid" '{state:$state, vpn_up:10, vpn_down:20, direct_up:300, direct_down:500, vpn_ok:true, direct_ok:true, flow_offload:false, month:"2026-11", now:"2026-11-17 18:10"}')
+	got=$(traffic_fold "$in") || { printf 'traffic reset error\n'; exit 1; }
+	printf '%s\n' "$got" | jq -e '.vpn_up == 60 and .vpn_down == 80 and .direct_down == 100 and .last_vpn_up == 10' >/dev/null || {
+		printf 'traffic reset failed\n%s\n' "$got"
+		exit 1
+	}
+	in=$(jq -n --argjson state "$mid" '{state:$state, vpn_up:180, vpn_down:300, direct_up:300, direct_down:450, vpn_ok:true, direct_ok:true, flow_offload:false, month:"2026-12", now:"2026-12-01 00:05"}')
+	got=$(traffic_fold "$in") || { printf 'traffic roll error\n'; exit 1; }
+	printf '%s\n' "$got" | jq -e '.month == "2026-12" and .vpn_up == 0 and .vpn_down == 0 and .direct_up == 0 and .direct_down == 0 and .since == "2026-12-01 00:05" and .history[0].month == "2026-11" and .history[0].vpn_up == 80 and .history[0].vpn_down == 100 and .history[0].direct_down == 50' >/dev/null || {
+		printf 'traffic roll failed\n%s\n' "$got"
+		exit 1
+	}
+	view=$(traffic_view "$got") || exit 1
+	printf '%s\n' "$view" | jq -e '.previous.month == "2026-11" and .previous.vpn.total == 180 and .vpn.total == 0' >/dev/null || {
+		printf 'traffic previous failed\n%s\n' "$view"
+		exit 1
+	}
+	in=$(jq -n --argjson state "$mid" '{state:$state, vpn_up:15, vpn_down:8, direct_up:10, direct_down:12, vpn_ok:true, direct_ok:true, flow_offload:false, month:"2026-12", now:"2026-12-01 00:05"}')
+	got=$(traffic_fold "$in") || { printf 'traffic roll-reset error\n'; exit 1; }
+	printf '%s\n' "$got" | jq -e '.vpn_up == 15 and .vpn_down == 8 and .direct_up == 10 and .direct_down == 12 and .history[0].vpn_up == 50 and .history[0].direct_down == 50' >/dev/null || {
+		printf 'traffic roll-reset failed\n%s\n' "$got"
+		exit 1
+	}
+	in=$(jq -n --argjson state "$mid" '{state:$state, vpn_up:99999, vpn_down:99999, direct_up:99999, direct_down:99999, vpn_ok:false, direct_ok:false, flow_offload:true, month:"2026-11", now:"2026-11-17 18:20"}')
+	got=$(traffic_fold "$in") || { printf 'traffic offline error\n'; exit 1; }
+	printf '%s\n' "$got" | jq -e '.vpn_up == 50 and .vpn_down == 60 and .direct_down == 50 and .last_vpn_up == 150 and .vpn_ok == false and .flow_offload == true' >/dev/null || {
+		printf 'traffic offline failed\n%s\n' "$got"
+		exit 1
+	}
+	in=$(jq -n '{state:null, vpn_up:0, vpn_down:0, direct_up:0, direct_down:0, vpn_ok:false, direct_ok:false, flow_offload:false, month:"2026-11", now:"2026-11-17 18:00"}')
+	blind=$(traffic_fold "$in") || exit 1
+	in=$(jq -n --argjson state "$blind" '{state:$state, vpn_up:5000000000, vpn_down:8000000000, direct_up:1000, direct_down:2000, vpn_ok:true, direct_ok:true, flow_offload:false, month:"2026-11", now:"2026-11-17 19:00"}')
+	got=$(traffic_fold "$in") || exit 1
+	printf '%s\n' "$got" | jq -e '.vpn_up == 0 and .last_vpn_up == 5000000000 and .direct_up == 0' >/dev/null || {
+		printf 'traffic late baseline failed\n%s\n' "$got"
+		exit 1
+	}
+	in=$(jq -n --argjson state "$got" '{state:$state, vpn_up:5123456789, vpn_down:8000000000, direct_up:1000, direct_down:2000, vpn_ok:true, direct_ok:true, flow_offload:false, month:"2026-11", now:"2026-11-17 19:05"}')
+	got=$(traffic_fold "$in") || exit 1
+	printf '%s\n' "$got" | jq -e '.vpn_up == 123456789' >/dev/null || {
+		printf 'traffic bigint failed\n%s\n' "$got"
+		exit 1
+	}
+	view=$(traffic_view null) || exit 1
+	printf '%s\n' "$view" | jq -e '.empty == true and .vpn.total == 0 and .previous == null' >/dev/null || {
+		printf 'traffic empty view failed\n%s\n' "$view"
+		exit 1
+	}
+}
+
 usage() {
-	printf '%s\n' 'Usage: podkop-subscription preview|apply [index]|status|cron-sync|self-test'
+	printf '%s\n' 'Usage: podkop-subscription preview|apply [index]|status|traffic|cron-sync|self-test'
 }
 
 SERVER_ARG=
@@ -1222,6 +1779,7 @@ case "$1" in
 		cmd_apply
 		;;
 	status) cmd_status ;;
+	traffic|traffic-sample) cmd_traffic ;;
 	cron-sync) cmd_cron_sync ;;
 	self-test) run_self_test ;;
 	*)

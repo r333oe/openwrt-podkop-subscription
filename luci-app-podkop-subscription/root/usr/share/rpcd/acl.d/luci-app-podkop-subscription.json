@@ -4,7 +4,7 @@
 		"read": {
 			"uci": [ "podkop-subscription", "podkop" ],
 			"ubus": {
-				"podkop-subscription": [ "status", "preview", "apply", "cron_sync" ]
+				"podkop-subscription": [ "status", "preview", "apply", "cron_sync", "traffic" ]
 			}
 		},
 		"write": {
